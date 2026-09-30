@@ -46,6 +46,11 @@ const OLLAMA_BASE_URL_DEFAULT = 'http://localhost:11434';
 const OLLAMA_MODEL_DEFAULT = 'qwen3:14b';
 const OLLAMA_MAX_TOKENS_DEFAULT = 8192;
 const OLLAMA_PROBE_TIMEOUT_MS = 1500;
+// Levels the panel's effort picker offers per provider. Gemini maps them to
+// thinkingLevel; Ollama applies them only when the model defines them and
+// otherwise keeps the model default.
+const GEMINI_EFFORTS = ['low', 'medium', 'high'];
+const LOCAL_EFFORTS = ['low', 'medium', 'high'];
 const GEMINI_REFUSALS = new Set([
   'SAFETY',
   'RECITATION',
@@ -205,6 +210,7 @@ function buildLocalRequest(messages, config) {
     system: ASSISTANT_SYSTEM_PROMPT,
     tools: CLAUDE_TOOLS,
     messages: prepareClaudeMessages(messages),
+    ...(config.effort ? { output_config: { effort: config.effort } } : {}),
   };
 }
 
@@ -286,6 +292,9 @@ function buildGeminiRequest(messages, config) {
       systemInstruction: ASSISTANT_SYSTEM_PROMPT,
       tools: [{ functionDeclarations: GEMINI_FUNCTIONS }],
       maxOutputTokens: config.maxTokens,
+      ...(config.effort
+        ? { thinkingConfig: { thinkingLevel: config.effort.toUpperCase() } }
+        : {}),
     },
   };
 }
@@ -443,6 +452,13 @@ function readRequestBody(req, limit) {
   });
 }
 
+/** Effort levels the panel may send for a provider ([] when not offered). */
+function effortsFor(provider, env = process.env) {
+  if (provider === 'claude')
+    return resolveClaudeConfig(env).effort === null ? [] : CLAUDE_EFFORTS;
+  return provider === 'gemini' ? GEMINI_EFFORTS : LOCAL_EFFORTS;
+}
+
 function createClaudeStatusHandler({
   env = process.env,
   fetchImpl = (...args) => fetch(...args),
@@ -489,6 +505,7 @@ function createClaudeStatusHandler({
       model: settings.model,
       maxTokens: settings.maxTokens,
       effort: settings.effort,
+      efforts: effortsFor(provider, env),
       fallbacks: settings.fallbacks,
       providers,
     });
@@ -544,7 +561,12 @@ function createClaudeChatHandler({
         });
         return;
       }
-      call = prepareProviderCall(provider, body?.messages);
+      const effort = body?.effort || null;
+      if (effort && !effortsFor(provider, env).includes(effort))
+        throw new TypeError(
+          `Effort "${effort}" is not offered for ${provider}`,
+        );
+      call = prepareProviderCall(provider, body?.messages, effort);
     } catch (error) {
       sendJson(res, error.status || 400, {
         error:
@@ -569,10 +591,13 @@ function createClaudeChatHandler({
   };
 
   /** Validate and build the request now; return the network call for later. */
-  function prepareProviderCall(provider, messages) {
+  function prepareProviderCall(provider, messages, effort) {
     if (provider === 'claude') {
       const apiKey = env.ANTHROPIC_API_KEY;
-      const params = buildClaudeRequest(messages, resolveClaudeConfig(env));
+      const config = resolveClaudeConfig(env);
+      // The panel's pick replaces the ANTHROPIC_EFFORT default.
+      if (effort) config.effort = effort;
+      const params = buildClaudeRequest(messages, config);
       const client = cachedClient(`claude:${apiKey}`, () =>
         createClient({ apiKey, ...(baseURL ? { baseURL } : {}) }),
       );
@@ -586,7 +611,7 @@ function createClaudeChatHandler({
       });
     }
     if (provider === 'local') {
-      const config = resolveLocalConfig(env);
+      const config = { ...resolveLocalConfig(env), effort };
       const params = buildLocalRequest(messages, config);
       const client = cachedClient(`local:${config.baseURL}`, () =>
         // Ollama ignores the key. No retries: a stopped server should say so
@@ -603,7 +628,7 @@ function createClaudeChatHandler({
       });
     }
     const apiKey = env.GEMINI_API_KEY;
-    const config = resolveGeminiConfig(env);
+    const config = { ...resolveGeminiConfig(env), effort };
     const request = buildGeminiRequest(messages, config);
     const client = cachedClient(`gemini:${apiKey}`, () =>
       createGeminiClient({
@@ -748,6 +773,20 @@ function claudeChatClient(win, { toolSchemas = null } = {}) {
     gemini: 'Gemini',
     local: 'AI local',
   };
+  const MODE_HINTS = {
+    claude:
+      'Thông minh nhất. Tính tiền theo token, cần ANTHROPIC_API_KEY còn tiền.',
+    free: 'Gemini gói miễn phí; hết lượt thì tự chuyển sang AI local.',
+    local: 'Chạy trên máy bạn qua Ollama, miễn phí; kém thông minh hơn.',
+  };
+  const MODE_SHORT = { claude: 'Claude', free: 'Miễn phí', local: 'AI local' };
+  const EFFORT_HINTS = {
+    claude:
+      'Mức suy nghĩ của Claude: cao hơn thì kỹ hơn nhưng chậm hơn và tốn token hơn.',
+    gemini: 'Mức suy nghĩ của Gemini (thinkingLevel).',
+    local:
+      'Chỉ có tác dụng nếu model local hỗ trợ; nếu không, Ollama dùng mức mặc định.',
+  };
   const FREE_LABELS = {
     gemini: 'Gemini: $0 với gói miễn phí',
     local: 'AI local: miễn phí',
@@ -757,12 +796,24 @@ function claudeChatClient(win, { toolSchemas = null } = {}) {
 #gev-claude-chat button,#gev-claude-chat select,#gev-claude-chat textarea{font:inherit;color:inherit}
 .gev-claude-toggle{background:#1b2230e6;border:1px solid #3b4a63;border-radius:18px;padding:6px 14px;cursor:pointer}
 .gev-claude-toggle[aria-expanded="true"]{display:none}
-.gev-claude-panel{width:min(380px,calc(100vw - 32px));max-height:min(560px,calc(100vh - 32px));display:flex;flex-direction:column;background:#10151ef2;border:1px solid #3b4a63;border-radius:10px;box-shadow:0 8px 28px #0008;overflow:hidden}
+.gev-claude-panel{position:relative;width:min(380px,calc(100vw - 32px));max-height:min(560px,calc(100vh - 32px));display:flex;flex-direction:column;background:#10151ef2;border:1px solid #3b4a63;border-radius:10px;box-shadow:0 8px 28px #0008;overflow:hidden}
 .gev-claude-panel[hidden]{display:none}
 .gev-claude-head{display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid #263041}
 .gev-claude-title{font-weight:600}
 .gev-claude-model{padding:4px 10px 0;opacity:.65;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.gev-claude-mode{flex:1;min-width:0;background:#1b2230;border:1px solid #3b4a63;border-radius:6px;padding:2px 4px}
+.gev-claude-head .gev-claude-settings-button{flex:1;min-width:0;text-align:left;background:#1b2230;border:1px solid #3b4a63;border-radius:6px;padding:2px 8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.gev-claude-settings{position:absolute;top:42px;left:8px;right:8px;z-index:2;max-height:calc(100% - 50px);overflow:auto;background:#141b27;border:1px solid #4a5d7e;border-radius:8px;box-shadow:0 8px 24px #000a;padding:10px;display:flex;flex-direction:column;gap:8px}
+.gev-claude-settings[hidden]{display:none}
+.gev-claude-panel.gev-claude-settings-open{min-height:min(470px,calc(100vh - 32px))}
+.gev-claude-choices{border:1px solid #263041;border-radius:6px;margin:0;padding:6px 8px;display:flex;flex-direction:column;gap:4px}
+.gev-claude-choices legend{padding:0 4px;font-weight:600}
+.gev-claude-choice{display:flex;gap:6px;align-items:flex-start;cursor:pointer}
+.gev-claude-choice span{display:flex;flex-direction:column}
+.gev-claude-choice small,.gev-claude-hint{opacity:.7;font-size:11px}
+.gev-claude-effort-list{display:flex;flex-wrap:wrap;gap:4px 12px}
+.gev-claude-spent{margin:0;font-size:12px;color:#f5c26b}
+.gev-claude-spent[hidden]{display:none}
+.gev-claude-done{align-self:flex-end;background:#244a7a;border:1px solid #5b8bd0;border-radius:6px;padding:3px 12px;cursor:pointer}
 .gev-claude-head button{background:none;border:1px solid transparent;border-radius:6px;padding:2px 8px;cursor:pointer}
 .gev-claude-head button:hover{border-color:#3b4a63}
 .gev-claude-log{flex:1;min-height:120px;overflow-y:auto;padding:8px 10px;display:flex;flex-direction:column;gap:6px}
@@ -797,6 +848,15 @@ function claudeChatClient(win, { toolSchemas = null } = {}) {
       : 'claude',
     geminiSpent: false,
     lastLocalReply: 0,
+    efforts: {
+      claude: readPref('effort.claude', ''),
+      gemini: readPref('effort.gemini', ''),
+      local: readPref('effort.local', ''),
+    },
+    effortProvider: null,
+    effortLevels: [],
+    effortDefault: '',
+    effortMaxTokens: 0,
     busy: false,
     abort: null,
     listening: false,
@@ -872,12 +932,62 @@ function claudeChatClient(win, { toolSchemas = null } = {}) {
       'aria-controls': 'gev-claude-panel',
       text: 'Chat AI',
     });
-    const mode = el(
-      'select',
-      { class: 'gev-claude-mode', 'aria-label': 'Chọn AI' },
-      MODES.map(([value, label]) => el('option', { value, text: label })),
+    const settingsButton = el('button', {
+      type: 'button',
+      class: 'gev-claude-settings-button',
+      'aria-haspopup': 'dialog',
+      'aria-expanded': 'false',
+      'aria-controls': 'gev-claude-settings',
+      title: 'Chọn nguồn AI và effort',
+      text: `⚙ ${MODE_SHORT[state.mode]}`,
+    });
+    const modeInputs = MODES.map(([value]) =>
+      el('input', { type: 'radio', name: 'gev-claude-mode', value }),
     );
-    mode.value = state.mode;
+    const spent = el('p', {
+      class: 'gev-claude-spent',
+      hidden: true,
+      text: 'Gemini đã hết lượt miễn phí nên đang dùng AI local. Bấm lại "Miễn phí" để thử Gemini.',
+    });
+    const effortLegend = el('legend', { text: 'Effort' });
+    const effortList = el('div', { class: 'gev-claude-effort-list' });
+    const effortHint = el('small', { class: 'gev-claude-hint' });
+    const done = el('button', {
+      type: 'button',
+      class: 'gev-claude-done',
+      text: 'Xong',
+    });
+    const settings = el(
+      'div',
+      {
+        id: 'gev-claude-settings',
+        class: 'gev-claude-settings',
+        role: 'dialog',
+        'aria-label': 'Chọn nguồn AI và effort',
+        hidden: true,
+      },
+      [
+        el('fieldset', { class: 'gev-claude-choices' }, [
+          el('legend', { text: 'Nguồn AI' }),
+          ...MODES.map(([value, label], index) =>
+            el('label', { class: 'gev-claude-choice' }, [
+              modeInputs[index],
+              el('span', {}, [
+                el('b', { text: label }),
+                el('small', { text: MODE_HINTS[value] }),
+              ]),
+            ]),
+          ),
+        ]),
+        spent,
+        el('fieldset', { class: 'gev-claude-choices' }, [
+          effortLegend,
+          effortList,
+          effortHint,
+        ]),
+        done,
+      ],
+    );
     const model = el('div', { class: 'gev-claude-model' });
     const clear = el('button', {
       type: 'button',
@@ -954,10 +1064,11 @@ function claudeChatClient(win, { toolSchemas = null } = {}) {
       [
         el('div', { class: 'gev-claude-head' }, [
           el('span', { class: 'gev-claude-title', text: 'Chat AI' }),
-          mode,
+          settingsButton,
           clear,
           close,
         ]),
+        settings,
         model,
         log,
         wait,
@@ -972,7 +1083,13 @@ function claudeChatClient(win, { toolSchemas = null } = {}) {
       root,
       toggle,
       panel,
-      mode,
+      settingsButton,
+      settings,
+      modeInputs,
+      spent,
+      effortLegend,
+      effortList,
+      effortHint,
       model,
       clear,
       close,
@@ -998,12 +1115,13 @@ function claudeChatClient(win, { toolSchemas = null } = {}) {
     });
     mic.addEventListener('click', toggleMic);
     speak.addEventListener('click', toggleSpeak);
-    mode.addEventListener('change', () => {
-      state.mode = mode.value;
-      state.geminiSpent = false;
-      writePref('mode', state.mode);
-      refreshStatus();
-    });
+    settingsButton.addEventListener('click', () =>
+      setSettingsOpen(settings.hidden),
+    );
+    done.addEventListener('click', () => setSettingsOpen(false));
+    // Click, not change: picking "Miễn phí" again must retry Gemini.
+    for (const input of modeInputs)
+      input.addEventListener('click', () => chooseMode(input.value));
     lang.addEventListener('change', () => {
       state.lang = lang.value;
       writePref('lang', state.lang);
@@ -1071,7 +1189,7 @@ function claudeChatClient(win, { toolSchemas = null } = {}) {
 
   function showProvider(status) {
     const provider = status.provider || providerForMode();
-    const label = `${PROVIDER_LABELS[provider] || provider} · ${status.model}${status.effort ? ` · effort ${status.effort}` : ''}`;
+    const label = `${PROVIDER_LABELS[provider] || provider} · ${status.model}`;
     let problem = '';
     if (!status.configured)
       problem =
@@ -1080,11 +1198,115 @@ function claudeChatClient(win, { toolSchemas = null } = {}) {
           : 'chưa có ANTHROPIC_API_KEY';
     else if (provider === 'local') problem = localProblem(status);
     ui.model.textContent = problem ? `${label} (${problem})` : label;
+    fillEffort(provider, status);
     notes.provider =
       provider === 'local'
         ? 'AI local: đặt OLLAMA_CONTEXT_LENGTH=32768 cho Ollama, vì hướng dẫn và 30 công cụ của app dài khoảng 14 nghìn token (Ollama mặc định chỉ đọc 4096).'
         : '';
     renderNote();
+  }
+
+  function fillEffort(provider, status) {
+    const levels = Array.isArray(status.efforts) ? status.efforts : [];
+    state.effortProvider = provider;
+    state.effortLevels = levels;
+    state.effortDefault = status.effort || '';
+    state.effortMaxTokens = status.maxTokens || 0;
+    const saved = levels.includes(state.efforts[provider])
+      ? state.efforts[provider]
+      : '';
+    const choices = levels.length
+      ? [
+          ['', status.effort ? `mặc định (${status.effort})` : 'mặc định'],
+          ...levels.map((level) => [level, level]),
+        ]
+      : [];
+    ui.effortLegend.textContent = `Effort (${PROVIDER_LABELS[provider] || provider})`;
+    ui.effortList.replaceChildren(
+      ...choices.map(([value, text]) => {
+        const input = el('input', {
+          type: 'radio',
+          name: 'gev-claude-effort',
+          value,
+        });
+        input.checked = value === saved;
+        input.addEventListener('change', () => chooseEffort(value));
+        return el('label', { class: 'gev-claude-choice' }, [input, text]);
+      }),
+    );
+    ui.effortHint.textContent = levels.length
+      ? EFFORT_HINTS[provider] || ''
+      : 'Model này không có mức effort.';
+    syncSettings();
+  }
+
+  function syncSettings() {
+    if (!ui) return;
+    for (const input of ui.modeInputs)
+      input.checked = input.value === state.mode;
+    ui.spent.hidden = !(state.mode === 'free' && state.geminiSpent);
+    const picked = state.effortProvider
+      ? state.efforts[state.effortProvider] || ''
+      : '';
+    const effort = state.effortLevels.includes(picked)
+      ? picked
+      : state.effortDefault;
+    ui.settingsButton.textContent = `⚙ ${MODE_SHORT[state.mode]}${state.effortLevels.length ? ` · ${effort || 'mặc định'}` : ''}`;
+  }
+
+  function setSettingsOpen(open) {
+    if (!mount()) return;
+    ui.settings.hidden = !open;
+    // Room for the whole popup even while the conversation is still short.
+    ui.panel.classList.toggle('gev-claude-settings-open', open);
+    ui.settingsButton.setAttribute('aria-expanded', String(open));
+    if (open) {
+      syncSettings();
+      refreshStatus();
+      (
+        ui.modeInputs.find((input) => input.checked) || ui.modeInputs[0]
+      ).focus();
+    } else {
+      ui.settingsButton.focus();
+    }
+  }
+
+  function chooseMode(value) {
+    state.mode = value;
+    state.geminiSpent = false;
+    writePref('mode', value);
+    syncSettings();
+    refreshStatus();
+  }
+
+  function chooseEffort(value) {
+    const provider = state.effortProvider;
+    if (!provider) return;
+    state.efforts[provider] = value;
+    writePref(`effort.${provider}`, value);
+    addLine('system', effortChangeText(provider, value));
+    syncSettings();
+  }
+
+  function effortChangeText(provider, value) {
+    const parts = [
+      `Effort ${PROVIDER_LABELS[provider] || provider}: ${value || 'mặc định'}, áp dụng từ tin kế tiếp.`,
+    ];
+    if (
+      provider === 'claude' &&
+      state.history.length &&
+      String(state.model).startsWith('claude:')
+    )
+      parts.push(
+        'Tin kế tiếp không dùng lại được cache của hội thoại nên tốn hơn một chút.',
+      );
+    if (provider === 'claude' && (value === 'xhigh' || value === 'max'))
+      parts.push(
+        `Mức này suy nghĩ lâu và có thể chạm giới hạn ${state.effortMaxTokens || 16000} token; nếu câu trả lời bị cắt, tăng ANTHROPIC_MAX_TOKENS.`,
+      );
+    if (provider === 'local')
+      parts.push('Chỉ có tác dụng nếu model local hỗ trợ.');
+    return parts.join(' ');
   }
 
   async function refreshStatus() {
@@ -1112,7 +1334,8 @@ function claudeChatClient(win, { toolSchemas = null } = {}) {
       if (!state.busy) submit();
     } else if (event.key === 'Escape' && !state.listening) {
       event.preventDefault();
-      setOpen(false);
+      if (!ui.settings.hidden) setSettingsOpen(false);
+      else setOpen(false);
     }
   }
 
@@ -1160,12 +1383,16 @@ function claudeChatClient(win, { toolSchemas = null } = {}) {
     return response.json();
   }
 
-  async function postChat(messages, provider, signal) {
+  async function postChat(messages, provider, effort, signal) {
     const response = await win.fetch('/api/claude/chat', {
       method: 'POST',
       signal,
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ provider, messages }),
+      body: JSON.stringify({
+        provider,
+        messages,
+        ...(effort ? { effort } : {}),
+      }),
     });
     let data = null;
     try {
@@ -1404,6 +1631,8 @@ function claudeChatClient(win, { toolSchemas = null } = {}) {
       }
       state.model = identity;
       state.modelLabel = identityLabel;
+      const picked = state.efforts[provider] || '';
+      const effort = (status.efforts || []).includes(picked) ? picked : '';
       checkpoint = state.history.length;
 
       addLine('user', voice ? `🎤 ${text}` : text);
@@ -1417,7 +1646,12 @@ function claudeChatClient(win, { toolSchemas = null } = {}) {
         const stopWaiting = startWaiting(provider);
         let message;
         try {
-          message = await postChat(state.history, provider, controller.signal);
+          message = await postChat(
+            state.history,
+            provider,
+            effort,
+            controller.signal,
+          );
         } finally {
           stopWaiting();
         }

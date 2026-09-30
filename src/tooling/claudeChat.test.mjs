@@ -397,6 +397,7 @@ test('proxy answers 503 without a key and never leaks the key in status', async 
         model: 'claude-sonnet-5-5',
         maxTokens: 16000,
         effort: 'medium',
+        efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
         fallbacks: true,
         providers: {
           claude: { configured: true, model: 'claude-sonnet-5-5' },
@@ -888,4 +889,95 @@ test('Gemini history drops blocks it has no form for', () => {
       { role: 'model', parts: [{ text: 'b' }] },
     ],
   );
+});
+
+test('effort picked in the panel reaches each provider', async () => {
+  // Claude: the pick replaces ANTHROPIC_EFFORT.
+  await withProxy(
+    { ANTHROPIC_API_KEY: 'k', ANTHROPIC_EFFORT: 'low' },
+    undefined,
+    async ({ upstream, proxy }) => {
+      await proxy.post({
+        effort: 'xhigh',
+        messages: [{ role: 'user', content: 'hi' }],
+      });
+      assert.deepEqual(upstream.requests[0].body.output_config, {
+        effort: 'xhigh',
+      });
+      const bad = await proxy.post({
+        effort: 'turbo',
+        messages: [{ role: 'user', content: 'hi' }],
+      });
+      assert.equal(bad.status, 400);
+      assert.equal(upstream.requests.length, 1);
+    },
+  );
+  // Haiku offers no effort at all.
+  await withProxy(
+    { ANTHROPIC_API_KEY: 'k', ANTHROPIC_MODEL: 'claude-haiku-4-5' },
+    undefined,
+    async ({ upstream, proxy }) => {
+      const status = await (
+        await fetch(`${proxy.origin}/api/claude/status`)
+      ).json();
+      assert.deepEqual(status.efforts, []);
+      const response = await proxy.post({
+        effort: 'high',
+        messages: [{ role: 'user', content: 'hi' }],
+      });
+      assert.equal(response.status, 400);
+      assert.equal(upstream.requests.length, 0);
+    },
+  );
+  // AI local: sent as output_config.effort only when picked.
+  const ollama = await startFakeAnthropic();
+  const local = await startProxy({ env: { OLLAMA_BASE_URL: ollama.baseURL } });
+  try {
+    const status = await (
+      await fetch(`${local.origin}/api/claude/status?provider=local`)
+    ).json();
+    assert.deepEqual(status.efforts, ['low', 'medium', 'high']);
+    await local.post({
+      provider: 'local',
+      effort: 'low',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.deepEqual(ollama.requests[0].body.output_config, { effort: 'low' });
+    const xhigh = await local.post({
+      provider: 'local',
+      effort: 'xhigh',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.equal(xhigh.status, 400);
+  } finally {
+    await local.close();
+    await ollama.close();
+  }
+  // Gemini: mapped to thinkingLevel.
+  const gemini = await startFakeGemini();
+  const proxy = await startProxy({
+    env: { GEMINI_API_KEY: 'g-key' },
+    geminiBaseURL: gemini.baseURL,
+  });
+  try {
+    await proxy.post({
+      provider: 'gemini',
+      effort: 'high',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    await proxy.post({
+      provider: 'gemini',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.deepEqual(gemini.requests[0].body.generationConfig.thinkingConfig, {
+      thinkingLevel: 'HIGH',
+    });
+    assert.equal(
+      'thinkingConfig' in gemini.requests[1].body.generationConfig,
+      false,
+    );
+  } finally {
+    await proxy.close();
+    await gemini.close();
+  }
 });

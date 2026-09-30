@@ -12,7 +12,8 @@
   short-answer note inside the user message so the cached system prompt never
   changes. The panel shows tokens and an estimated cost per message. The OpenAI
   voice button and hold-Space push-to-talk are unchanged; keys typed in the
-  panel do not reach app shortcuts. The panel's menu picks the source:
+  panel do not reach app shortcuts. The panel's `⚙` button opens a popup to
+  pick the effort and the source:
   **Claude API** (paid), **Miễn phí** (Gemini free tier via `GEMINI_API_KEY`,
   moving to AI local when Gemini answers 429), or **AI local** (Ollama's
   Anthropic-compatible API, default model `qwen3:14b`). `npm run

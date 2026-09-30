@@ -52,6 +52,7 @@ function setup({
   geminiConfigured = true,
   local = { reachable: true, installed: true },
   toolSchemas = null,
+  claudeEfforts = ['low', 'medium', 'high', 'xhigh', 'max'],
 } = {}) {
   const dom = new JSDOM(
     '<!doctype html><html><head></head><body></body></html>',
@@ -80,6 +81,10 @@ function setup({
         provider,
         configured: provider === 'gemini' ? geminiConfigured : true,
         model,
+        maxTokens: provider === 'local' ? 8192 : 16000,
+        effort: provider === 'claude' && claudeEfforts.length ? 'medium' : null,
+        efforts:
+          provider === 'claude' ? claudeEfforts : ['low', 'medium', 'high'],
         providers: {
           local: { baseURL: 'http://localhost:11434', ...local },
         },
@@ -150,10 +155,18 @@ function setup({
 }
 
 function pickMode(chat, value) {
-  chat.ui.mode.value = value;
-  chat.ui.mode.dispatchEvent(
-    new chat.ui.mode.ownerDocument.defaultView.Event('change'),
-  );
+  chat.ui.modeInputs.find((input) => input.value === value).click();
+}
+
+function effortChoices(chat) {
+  return [...chat.ui.effortList.querySelectorAll('label')].map((label) => {
+    const input = label.querySelector('input');
+    return `${input.checked ? '*' : ''}${input.value}=${label.textContent}`;
+  });
+}
+
+function pickEffort(chat, value) {
+  chat.ui.effortList.querySelector(`input[value="${value}"]`).click();
 }
 
 test('spoken transcript goes through send() and is marked as voice', async () => {
@@ -432,9 +445,8 @@ test('Claude API mode asks for Claude and prices the message', async () => {
     replies: [textReply('Chào')],
   });
   chat.shareRunner(async () => ({ ok: true }));
-  assert.equal(chat.ui.mode.value, 'claude');
   assert.deepEqual(
-    [...chat.ui.mode.options].map((option) => option.value),
+    [...chat.ui.modeInputs].map((input) => input.value),
     ['claude', 'free', 'local'],
   );
   await chat.send('chào');
@@ -706,4 +718,135 @@ test('a waiting line counts seconds and clears when the reply lands', async () =
   release();
   assert.equal(await sending, true);
   assert.equal(chat.ui.wait.textContent, '');
+});
+
+test('the ⚙ button opens a popup to pick the source and the effort', async () => {
+  const { chat, chatBodies } = setup({ replies: [textReply('ok')] });
+  chat.shareRunner(async () => ({ ok: true }));
+  chat.setOpen(true);
+  const { ui } = chat;
+  assert.equal(ui.settings.hidden, true);
+  ui.settingsButton.click();
+  assert.equal(ui.settings.hidden, false);
+  assert.equal(ui.settingsButton.getAttribute('aria-expanded'), 'true');
+  await settle(() => ui.effortList.children.length === 6, 'effort choices');
+  assert.deepEqual(
+    [...ui.modeInputs].map(
+      (input) => `${input.checked ? '*' : ''}${input.value}`,
+    ),
+    ['*claude', 'free', 'local'],
+  );
+  assert.deepEqual(effortChoices(chat), [
+    '*=mặc định (medium)',
+    'low=low',
+    'medium=medium',
+    'high=high',
+    'xhigh=xhigh',
+    'max=max',
+  ]);
+  assert.equal(ui.effortLegend.textContent, 'Effort (Claude)');
+  assert.equal(ui.settingsButton.textContent, '⚙ Claude · medium');
+
+  pickEffort(chat, 'high');
+  assert.equal(ui.settingsButton.textContent, '⚙ Claude · high');
+  let lines = [...ui.log.children].map((line) => line.textContent);
+  assert.match(lines.at(-1), /^Effort Claude: high, áp dụng từ tin kế tiếp\.$/);
+
+  ui.settings.querySelector('.gev-claude-done').click();
+  assert.equal(ui.settings.hidden, true);
+  await chat.send('chào');
+  assert.equal(chatBodies[0].effort, 'high');
+
+  // xhigh/max warn about the output cap; a later change mentions the cache.
+  pickEffort(chat, 'max');
+  lines = [...ui.log.children].map((line) => line.textContent);
+  assert.match(lines.at(-1), /cache/);
+  assert.match(lines.at(-1), /16000 token/);
+});
+
+test('each source keeps its own effort, and "mặc định" sends none', async () => {
+  const { chat, chatBodies } = setup({
+    replies: [
+      textReply('claude'),
+      { ...textReply('local'), model: 'qwen3:14b', provider: 'local' },
+      { ...textReply('local 2'), model: 'qwen3:14b', provider: 'local' },
+      textReply('claude 2'),
+    ],
+  });
+  chat.shareRunner(async () => ({ ok: true }));
+  chat.setOpen(true);
+  chat.ui.settingsButton.click();
+  await settle(() => chat.ui.effortList.children.length === 6, 'claude');
+  pickEffort(chat, 'high');
+  await chat.send('một');
+
+  pickMode(chat, 'local');
+  await settle(() => chat.ui.effortList.children.length === 4, 'local');
+  assert.equal(chat.ui.effortLegend.textContent, 'Effort (AI local)');
+  assert.deepEqual(effortChoices(chat), [
+    '*=mặc định',
+    'low=low',
+    'medium=medium',
+    'high=high',
+  ]);
+  assert.match(chat.ui.effortHint.textContent, /model local hỗ trợ/);
+  await chat.send('hai');
+  assert.equal('effort' in chatBodies[1], false);
+  pickEffort(chat, 'low');
+  await chat.send('ba');
+  assert.equal(chatBodies[2].effort, 'low');
+
+  pickMode(chat, 'claude');
+  await settle(() => chat.ui.effortList.children.length === 6, 'claude again');
+  assert.equal(chat.ui.settingsButton.textContent, '⚙ Claude · high');
+  await chat.send('bốn');
+  assert.equal(chatBodies[3].effort, 'high');
+});
+
+test('a model without effort shows no effort choices', async () => {
+  const { chat, chatBodies } = setup({ claudeEfforts: [] });
+  chat.shareRunner(async () => ({ ok: true }));
+  chat.setOpen(true);
+  chat.ui.settingsButton.click();
+  await settle(
+    () => chat.ui.effortHint.textContent === 'Model này không có mức effort.',
+    'no effort hint',
+  );
+  assert.equal(chat.ui.effortList.children.length, 0);
+  assert.equal(chat.ui.settingsButton.textContent, '⚙ Claude');
+  await chat.send('chào');
+  assert.equal('effort' in chatBodies[0], false);
+});
+
+test('Escape closes the popup before the panel', async () => {
+  const { win, chat } = setup();
+  chat.shareRunner(async () => ({ ok: true }));
+  chat.setOpen(true);
+  chat.ui.settingsButton.click();
+  const escape = () =>
+    chat.ui.settingsButton.dispatchEvent(
+      new win.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }),
+    );
+  escape();
+  assert.equal(chat.ui.settings.hidden, true);
+  assert.equal(chat.ui.panel.hidden, false);
+  escape();
+  assert.equal(chat.ui.panel.hidden, true);
+});
+
+test('the popup says when free mode is running on AI local', async () => {
+  const { chat } = setup({
+    replies: [
+      { httpStatus: 429, body: { error: 'Quota', type: 'quota_exhausted' } },
+      { ...textReply('local'), model: 'qwen3:14b', provider: 'local' },
+    ],
+  });
+  chat.shareRunner(async () => ({ ok: true }));
+  pickMode(chat, 'free');
+  assert.equal(chat.ui.spent.hidden, true);
+  await chat.send('chào');
+  assert.equal(chat.ui.spent.hidden, false);
+  assert.match(chat.ui.settingsButton.textContent, /^⚙ Miễn phí/);
+  pickMode(chat, 'free');
+  assert.equal(chat.ui.spent.hidden, true);
 });
