@@ -3856,6 +3856,18 @@ and unreachable upstream (502/504) separately from road geometry.
   4. **The loaded-data caveat is stated once when relevant**: counts cover loaded data, and the flights layer loads where you look (appended to `coverage.note` for radius/view scopes over viewport-loaded layers).
 - **Degradation**: without `OPENAI_API_KEY`, `/api/realtime/token` returns 503 and the mic button surfaces the error; the rest of the app is unaffected.
 
+### Claude Chat (September 2026)
+
+The `Claude` button (bottom-left) opens a chat panel, registered by `claudeChatPlugin()` in `server/standalone/vite.config.js` before `apiNotFoundPlugin()`.
+
+- **Proxy**: `POST /api/claude/chat` forwards `{messages}` to the Anthropic Messages API with `ANTHROPIC_API_KEY` held by the Vite middleware; `GET /api/claude/status` returns `{configured, model, maxTokens, effort, fallbacks}` and never the key. Defaults: `claude-sonnet-5-5`, `max_tokens` 16000 (thinking counts toward it), `output_config.effort` `medium`; `ANTHROPIC_MODEL`, `ANTHROPIC_MAX_TOKENS`, `ANTHROPIC_EFFORT` (low|medium|high|xhigh|max) override them, and effort is omitted for Haiku models. On `claude-sonnet-5-5` the request opts into server-side refusal fallback (`fallbacks: "default"`, beta `server-side-fallback-2026-07-01`); `ANTHROPIC_FALLBACKS=off` turns it off. POSTs must be same-origin JSON.
+- **Tools**: the same 30 schemas as the Realtime agent (`GEV_REALTIME_TOOLS`), converted to `input_schema`. The plugin's `transform` hook patches `src/voice/gevRealtime.js` in memory so the runner it builds is also handed to the chat panel; the file on disk is unchanged. If the patch site moves, the panel still mounts without tools and Claude is told they are unavailable.
+- **Caching**: tools and system never vary. A spoken turn is sent with `voice: true` and the server appends a short-answer note as a text block inside that user message, never in `system`.
+- **Voice**: the mic uses `SpeechRecognition`/`webkitSpeechRecognition` (`vi-VN` default, `en-US` selectable), shows interim text, and sends the transcript through the same `send()` and tool loop as typed text. Pressing the mic cancels read-aloud. Where recognition is missing (Firefox) the mic is hidden with a note. Read-aloud uses `speechSynthesis` with a voice matching the chosen language, or shows a note when none exists.
+- **History**: kept in the page. Before each message the panel reads `/api/claude/status`; a model change clears the history, since thinking blocks are bound to the model. Errors and refusals roll the turn back.
+- **Keys**: keydown/keyup/keypress events inside the panel are stopped at window capture, so app shortcuts and hold-Space push-to-talk never see chat typing. The OpenAI voice control is unchanged.
+- **Cost readout**: tokens per message from `usage`, with a cost estimate for `claude-sonnet-5-5` ($2 input, $10 output, $2.5 cache write, $0.2 cache read per million tokens).
+
 ### AI HUD Summary (June 2026)
 
 - HUD `SUMMARY` readout requests a five-word intelligence-style summary from `/api/openai/hud-summary` (model `OPENAI_HUD_SUMMARY_MODEL`, default `gpt-5-nano`, minimal reasoning).

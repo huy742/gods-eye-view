@@ -1,5 +1,19 @@
 # Changelog
 
+- Claude chat panel (bottom-left "Claude" button): type or speak to Claude,
+  which drives the map through the same 30 tools as the OpenAI voice agent.
+  `server/providers/claude-chat.js` proxies `/api/claude/chat` to the Anthropic
+  Messages API with `ANTHROPIC_API_KEY` kept on the server, and reports the
+  active model on `/api/claude/status`. Defaults: `claude-sonnet-5-5`, 16000
+  output tokens, `medium` effort (`ANTHROPIC_MODEL`, `ANTHROPIC_MAX_TOKENS`,
+  `ANTHROPIC_EFFORT`). The mic uses the browser's Web Speech API (hidden where
+  unsupported, e.g. Firefox), Vietnamese by default with English available;
+  replies can be read aloud with `speechSynthesis`. Spoken turns carry a
+  short-answer note inside the user message so the cached system prompt never
+  changes. The panel shows tokens and an estimated cost per message. The OpenAI
+  voice button and hold-Space push-to-talk are unchanged; keys typed in the
+  panel do not reach app shortcuts.
+
 - Public Overpass instances are no longer used by default. Street Traffic
   roads come from TomTom flow tiles, OpenFreeMap vector tiles, or both, chosen
   on the layer row (TomTom / OSM / Hybrid) or with `?trafficRoads=`. With a
