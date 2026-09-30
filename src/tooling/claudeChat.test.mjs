@@ -5,7 +5,9 @@ import http from 'node:http';
 import test from 'node:test';
 
 import {
+  ASSISTANT_SYSTEM_PROMPT,
   CLAUDE_FALLBACK_BETA,
+  CLAUDE_SYSTEM_PROMPT,
   CLAUDE_TOOLS,
   MAX_OUTPUT_TOKENS,
   RESOLVED_VIRTUAL_ID,
@@ -14,7 +16,11 @@ import {
   claudeChatPlugin,
   createClaudeChatHandler,
   createClaudeStatusHandler,
+  fromGeminiResponse,
   resolveClaudeConfig,
+  resolveGeminiConfig,
+  resolveLocalConfig,
+  toGeminiContents,
 } from '../../server/providers/claude-chat.js';
 
 const TEXT_REPLY = {
@@ -80,9 +86,17 @@ function writeMessageStream(res, message) {
 }
 
 /** A fake Anthropic API that records every request it receives. */
-async function startFakeAnthropic(reply = () => ({ message: TEXT_REPLY })) {
+async function startFakeAnthropic(
+  reply = () => ({ message: TEXT_REPLY }),
+  tags = [],
+) {
   const requests = [];
   const server = http.createServer(async (req, res) => {
+    if (req.method === 'GET' && req.url === '/api/tags') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ models: tags }));
+      return;
+    }
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
@@ -378,11 +392,21 @@ test('proxy answers 503 without a key and never leaks the key in status', async 
       ).text();
       assert.equal(text.includes('sk-secret-value'), false);
       assert.deepEqual(JSON.parse(text), {
+        provider: 'claude',
         configured: true,
         model: 'claude-sonnet-5-5',
         maxTokens: 16000,
         effort: 'medium',
         fallbacks: true,
+        providers: {
+          claude: { configured: true, model: 'claude-sonnet-5-5' },
+          gemini: { configured: false, model: 'gemini-flash-latest' },
+          local: {
+            configured: true,
+            model: 'qwen3:14b',
+            baseURL: 'http://localhost:11434',
+          },
+        },
       });
     },
   );
@@ -453,4 +477,407 @@ test('transform shares the voice runner without touching other files', () => {
   const moduleSource = plugin.load(RESOLVED_VIRTUAL_ID);
   assert.match(moduleSource, /export const shareRunner = chat\.shareRunner;/);
   assert.equal(plugin.load('other'), null);
+});
+
+// ---- Gemini and AI local --------------------------------------------------
+
+const GEMINI_TOOL_CALL = {
+  responseId: 'resp_1',
+  modelVersion: 'gemini-flash-test',
+  candidates: [
+    {
+      content: {
+        role: 'model',
+        parts: [
+          {
+            functionCall: { id: 'c1', name: 'zoom_to_globe', args: {} },
+            thoughtSignature: 'SIG',
+          },
+        ],
+      },
+      finishReason: 'STOP',
+    },
+  ],
+  usageMetadata: {
+    promptTokenCount: 100,
+    cachedContentTokenCount: 40,
+    candidatesTokenCount: 5,
+    thoughtsTokenCount: 7,
+  },
+};
+
+/** A fake Gemini API (generateContent) that records every request. */
+async function startFakeGemini(reply = () => ({ body: GEMINI_TOOL_CALL })) {
+  const requests = [];
+  const server = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    requests.push({ url: req.url, headers: req.headers, body });
+    const outcome = reply(body, requests.length);
+    res.writeHead(outcome.status || 200, {
+      'Content-Type': 'application/json',
+    });
+    res.end(JSON.stringify(outcome.body));
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  return {
+    requests,
+    baseURL: `http://127.0.0.1:${server.address().port}`,
+    close: () => new Promise((resolve) => server.close(resolve)),
+  };
+}
+
+async function closedPortURL() {
+  const server = http.createServer();
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const url = `http://127.0.0.1:${server.address().port}`;
+  await new Promise((resolve) => server.close(resolve));
+  return url;
+}
+
+test('Gemini and AI local defaults and overrides', () => {
+  assert.deepEqual(resolveGeminiConfig({}), {
+    model: 'gemini-flash-latest',
+    maxTokens: 16000,
+  });
+  assert.deepEqual(
+    resolveGeminiConfig({ GEMINI_MODEL: 'gemini-x', GEMINI_MAX_TOKENS: '900' }),
+    { model: 'gemini-x', maxTokens: 900 },
+  );
+  assert.deepEqual(resolveLocalConfig({}), {
+    model: 'qwen3:14b',
+    maxTokens: 8192,
+    baseURL: 'http://localhost:11434',
+  });
+  assert.deepEqual(
+    resolveLocalConfig({
+      OLLAMA_MODEL: 'gpt-oss:20b',
+      OLLAMA_MAX_TOKENS: '4096',
+      OLLAMA_BASE_URL: 'http://127.0.0.1:1234/',
+    }),
+    { model: 'gpt-oss:20b', maxTokens: 4096, baseURL: 'http://127.0.0.1:1234' },
+  );
+  assert.match(CLAUDE_SYSTEM_PROMPT, /^You are Claude, the assistant inside/);
+  assert.match(ASSISTANT_SYSTEM_PROMPT, /^You are the assistant inside/);
+});
+
+test('status for AI local says whether Ollama runs and has the model', async () => {
+  const ollama = await startFakeAnthropic(undefined, [
+    { name: 'qwen3:14b', model: 'qwen3:14b' },
+  ]);
+  const read = async (env) => {
+    const proxy = await startProxy({ env });
+    try {
+      return await (
+        await fetch(`${proxy.origin}/api/claude/status?provider=local`)
+      ).json();
+    } finally {
+      await proxy.close();
+    }
+  };
+  try {
+    let status = await read({ OLLAMA_BASE_URL: ollama.baseURL });
+    assert.equal(status.provider, 'local');
+    assert.equal(status.configured, true);
+    assert.equal(status.model, 'qwen3:14b');
+    assert.equal(status.effort, null);
+    assert.equal(status.providers.local.reachable, true);
+    assert.equal(status.providers.local.installed, true);
+
+    status = await read({
+      OLLAMA_BASE_URL: ollama.baseURL,
+      OLLAMA_MODEL: 'gpt-oss:20b',
+    });
+    assert.equal(status.providers.local.installed, false);
+
+    status = await read({ OLLAMA_BASE_URL: await closedPortURL() });
+    assert.equal(status.providers.local.reachable, false);
+  } finally {
+    await ollama.close();
+  }
+});
+
+test('AI local uses Ollama Messages API without Claude-only fields', async () => {
+  const ollama = await startFakeAnthropic(() => ({
+    message: { ...TEXT_REPLY, model: 'qwen3:14b' },
+  }));
+  const proxy = await startProxy({ env: { OLLAMA_BASE_URL: ollama.baseURL } });
+  try {
+    const response = await proxy.post({
+      provider: 'local',
+      messages: [{ role: 'user', content: 'bay tới Paris', voice: true }],
+    });
+    assert.equal(response.status, 200);
+    const message = await response.json();
+    assert.equal(message.provider, 'local');
+    assert.equal(message.model, 'qwen3:14b');
+
+    const { url, headers, body } = ollama.requests[0];
+    assert.match(url, /^\/v1\/messages/);
+    assert.equal(headers['x-api-key'], 'ollama');
+    assert.equal(headers['anthropic-beta'], undefined);
+    assert.equal(body.model, 'qwen3:14b');
+    assert.equal(body.max_tokens, 8192);
+    assert.equal(body.system, ASSISTANT_SYSTEM_PROMPT);
+    assert.equal(body.tools.length, 30);
+    for (const field of ['cache_control', 'fallbacks', 'output_config'])
+      assert.equal(field in body, false, field);
+    assert.deepEqual(body.messages[0].content.at(-1), {
+      type: 'text',
+      text: VOICE_TURN_NOTE,
+    });
+  } finally {
+    await proxy.close();
+    await ollama.close();
+  }
+});
+
+test('AI local explains a stopped Ollama', async () => {
+  const proxy = await startProxy({
+    env: { OLLAMA_BASE_URL: await closedPortURL() },
+  });
+  try {
+    const response = await proxy.post({
+      provider: 'local',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.equal(response.status, 502);
+    const body = await response.json();
+    assert.equal(body.type, 'local_unreachable');
+    assert.match(body.error, /Không kết nối được Ollama/);
+  } finally {
+    await proxy.close();
+  }
+});
+
+test('Gemini gets the key header, system, 30 tools and the voice note', async () => {
+  const gemini = await startFakeGemini();
+  const proxy = await startProxy({
+    env: { GEMINI_API_KEY: 'g-key' },
+    geminiBaseURL: gemini.baseURL,
+  });
+  try {
+    const response = await proxy.post({
+      provider: 'gemini',
+      messages: [{ role: 'user', content: 'toàn cầu', voice: true }],
+    });
+    assert.equal(response.status, 200);
+    const message = await response.json();
+    assert.equal(message.provider, 'gemini');
+    assert.equal(message.model, 'gemini-flash-test');
+    assert.equal(message.stop_reason, 'tool_use');
+    assert.deepEqual(message.content, [
+      {
+        type: 'tool_use',
+        id: 'c1',
+        name: 'zoom_to_globe',
+        input: {},
+        gemini_call_id: 'c1',
+        gemini_thought_signature: 'SIG',
+      },
+    ]);
+    assert.deepEqual(message.usage, {
+      input_tokens: 60,
+      output_tokens: 12,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 40,
+    });
+
+    const { url, headers, body } = gemini.requests[0];
+    assert.equal(url, '/v1beta/models/gemini-flash-latest:generateContent');
+    assert.equal(headers['x-goog-api-key'], 'g-key');
+    assert.equal(body.systemInstruction.parts[0].text, ASSISTANT_SYSTEM_PROMPT);
+    assert.equal(body.generationConfig.maxOutputTokens, 16000);
+    const declarations = body.tools[0].functionDeclarations;
+    assert.equal(declarations.length, 30);
+    assert.equal(declarations[0].parametersJsonSchema.type, 'object');
+    assert.deepEqual(body.contents, [
+      {
+        role: 'user',
+        parts: [{ text: 'toàn cầu' }, { text: VOICE_TURN_NOTE }],
+      },
+    ]);
+  } finally {
+    await proxy.close();
+    await gemini.close();
+  }
+});
+
+test('Gemini round trip returns thought signatures and function results', async () => {
+  const gemini = await startFakeGemini(() => ({
+    body: {
+      candidates: [
+        {
+          content: { role: 'model', parts: [{ text: 'Đã xong.' }] },
+          finishReason: 'STOP',
+        },
+      ],
+    },
+  }));
+  const proxy = await startProxy({
+    env: { GEMINI_API_KEY: 'g-key' },
+    geminiBaseURL: gemini.baseURL,
+  });
+  try {
+    const first = fromGeminiResponse(GEMINI_TOOL_CALL, 'gemini-flash-latest');
+    const response = await proxy.post({
+      provider: 'gemini',
+      messages: [
+        { role: 'user', content: 'toàn cầu' },
+        { role: 'assistant', content: first.content },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'c1',
+              content: '{"ok":true,"action":"zoom_to_globe"}',
+            },
+          ],
+        },
+      ],
+    });
+    const message = await response.json();
+    assert.equal(message.stop_reason, 'end_turn');
+    assert.deepEqual(message.content, [{ type: 'text', text: 'Đã xong.' }]);
+    assert.deepEqual(gemini.requests[0].body.contents.slice(1), [
+      {
+        role: 'model',
+        parts: [
+          {
+            functionCall: { name: 'zoom_to_globe', args: {}, id: 'c1' },
+            thoughtSignature: 'SIG',
+          },
+        ],
+      },
+      {
+        role: 'user',
+        parts: [
+          {
+            functionResponse: {
+              name: 'zoom_to_globe',
+              response: { ok: true, action: 'zoom_to_globe' },
+              id: 'c1',
+            },
+          },
+        ],
+      },
+    ]);
+  } finally {
+    await proxy.close();
+    await gemini.close();
+  }
+});
+
+test('a spent Gemini quota answers 429 quota_exhausted at once', async () => {
+  const gemini = await startFakeGemini(() => ({
+    status: 429,
+    body: {
+      error: {
+        code: 429,
+        message: 'You exceeded your current quota.',
+        status: 'RESOURCE_EXHAUSTED',
+      },
+    },
+  }));
+  const proxy = await startProxy({
+    env: { GEMINI_API_KEY: 'g-key' },
+    geminiBaseURL: gemini.baseURL,
+  });
+  try {
+    const response = await proxy.post({
+      provider: 'gemini',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.equal(response.status, 429);
+    assert.deepEqual(await response.json(), {
+      error: 'You exceeded your current quota.',
+      type: 'quota_exhausted',
+    });
+    assert.equal(gemini.requests.length, 1, 'no retries');
+  } finally {
+    await proxy.close();
+    await gemini.close();
+  }
+});
+
+test('provider checks: missing Gemini key, unknown provider', async () => {
+  const proxy = await startProxy({ env: {} });
+  try {
+    let response = await proxy.post({
+      provider: 'gemini',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), {
+      error: 'GEMINI_API_KEY is not set',
+      type: 'not_configured',
+    });
+    response = await proxy.post({
+      provider: 'openai',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.equal(response.status, 400);
+  } finally {
+    await proxy.close();
+  }
+});
+
+test('Gemini safety stops and blocked prompts become refusals', () => {
+  const safety = fromGeminiResponse(
+    {
+      candidates: [
+        { content: { role: 'model', parts: [] }, finishReason: 'SAFETY' },
+      ],
+    },
+    'm',
+  );
+  assert.equal(safety.stop_reason, 'refusal');
+  assert.equal(safety.stop_details.category, 'SAFETY');
+  const blocked = fromGeminiResponse(
+    { promptFeedback: { blockReason: 'PROHIBITED_CONTENT' } },
+    'm',
+  );
+  assert.equal(blocked.stop_reason, 'refusal');
+  assert.equal(blocked.stop_details.category, 'PROHIBITED_CONTENT');
+  const cut = fromGeminiResponse(
+    {
+      candidates: [
+        {
+          content: { role: 'model', parts: [{ text: 'abc' }] },
+          finishReason: 'MAX_TOKENS',
+        },
+      ],
+    },
+    'm',
+  );
+  assert.equal(cut.stop_reason, 'max_tokens');
+});
+
+test('Gemini history drops blocks it has no form for', () => {
+  assert.deepEqual(
+    toGeminiContents([
+      { role: 'user', content: 'a' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: '', signature: 's' },
+          { type: 'text', text: 'b' },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'missing', content: 'x' },
+        ],
+      },
+    ]),
+    [
+      { role: 'user', parts: [{ text: 'a' }] },
+      { role: 'model', parts: [{ text: 'b' }] },
+    ],
+  );
 });

@@ -33,6 +33,7 @@
   ],
   "scripts": {
     "doctor": "node scripts/setup-doctor.mjs",
+    "setup:local-ai": "node scripts/setup-local-ai.mjs",
     "format": "node scripts/format.mjs --write",
     "format:check": "node scripts/format.mjs --check",
     "layer-token:next": "node scripts/next-layer-state-token.mjs",
@@ -62,6 +63,7 @@
   },
   "devDependencies": {
     "@anthropic-ai/sdk": "^0.129.0",
+    "@google/genai": "^2.24.0",
     "jsdom": "^30.1.1",
     "prettier": "3.9.6",
     "puppeteer": "^25.10.0",

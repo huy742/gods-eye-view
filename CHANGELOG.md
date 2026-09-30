@@ -12,7 +12,12 @@
   short-answer note inside the user message so the cached system prompt never
   changes. The panel shows tokens and an estimated cost per message. The OpenAI
   voice button and hold-Space push-to-talk are unchanged; keys typed in the
-  panel do not reach app shortcuts.
+  panel do not reach app shortcuts. The panel's menu picks the source:
+  **Claude API** (paid), **Miễn phí** (Gemini free tier via `GEMINI_API_KEY`,
+  moving to AI local when Gemini answers 429), or **AI local** (Ollama's
+  Anthropic-compatible API, default model `qwen3:14b`). `npm run
+  setup:local-ai` checks Ollama, pulls the model and sets
+  `OLLAMA_CONTEXT_LENGTH=32768`.
 
 - Public Overpass instances are no longer used by default. Street Traffic
   roads come from TomTom flow tiles, OpenFreeMap vector tiles, or both, chosen

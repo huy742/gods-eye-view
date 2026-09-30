@@ -42,6 +42,8 @@ function setup({
   voices = [{ lang: 'vi-VN', name: 'Linh' }],
   models = ['claude-sonnet-5-5'],
   replies = [],
+  geminiConfigured = true,
+  local = { reachable: true, installed: true },
 } = {}) {
   const dom = new JSDOM(
     '<!doctype html><html><head></head><body></body></html>',
@@ -53,19 +55,37 @@ function setup({
   let statusCalls = 0;
   const queue = [...replies];
 
+  const statusProviders = [];
   win.fetch = async (url, init = {}) => {
-    events.push(`fetch ${url}`);
-    if (url === '/api/claude/status') {
-      const model = models[Math.min(statusCalls, models.length - 1)];
-      statusCalls++;
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({ configured: true, model }),
+    const [path, query = ''] = url.split('?');
+    events.push(`fetch ${path}`);
+    if (path === '/api/claude/status') {
+      const provider = new URLSearchParams(query).get('provider');
+      statusProviders.push(provider);
+      const model =
+        provider === 'gemini'
+          ? 'gemini-flash-latest'
+          : provider === 'local'
+            ? 'qwen3:14b'
+            : models[Math.min(statusCalls++, models.length - 1)];
+      const body = {
+        provider,
+        configured: provider === 'gemini' ? geminiConfigured : true,
+        model,
+        providers: {
+          local: { baseURL: 'http://localhost:11434', ...local },
+        },
       };
+      return { ok: true, status: 200, json: async () => body };
     }
     chatBodies.push(JSON.parse(init.body));
     const reply = queue.shift() || textReply('ok');
+    if (reply.httpStatus)
+      return {
+        ok: false,
+        status: reply.httpStatus,
+        json: async () => reply.body,
+      };
     return { ok: true, status: 200, json: async () => reply };
   };
 
@@ -109,7 +129,22 @@ function setup({
   // any reference to this file's module scope would throw here.
   const createClaudeChat = win.eval(`(${claudeChatClient.toString()})`);
   const chat = createClaudeChat(win);
-  return { win, chat, events, chatBodies, recognitions, spoken };
+  return {
+    win,
+    chat,
+    events,
+    chatBodies,
+    recognitions,
+    spoken,
+    statusProviders,
+  };
+}
+
+function pickMode(chat, value) {
+  chat.ui.mode.value = value;
+  chat.ui.mode.dispatchEvent(
+    new chat.ui.mode.ownerDocument.defaultView.Event('change'),
+  );
 }
 
 test('spoken transcript goes through send() and is marked as voice', async () => {
@@ -303,7 +338,13 @@ test('a model change clears the history first', async () => {
     { role: 'user', content: 'lần 2' },
   ]);
   const lines = [...chat.ui.log.children].map((line) => line.textContent);
-  assert.ok(lines.some((line) => /Model đổi/.test(line)));
+  assert.ok(
+    lines.some((line) =>
+      line.startsWith(
+        'Đổi từ Claude claude-sonnet-5-5 sang Claude claude-opus-5-5',
+      ),
+    ),
+  );
 });
 
 test('keys typed in the chat never reach the app shortcuts', async () => {
@@ -374,5 +415,179 @@ test('shareRunner hands the runner back and mounts a single panel', () => {
   assert.equal(
     chat.ui.root.ownerDocument.querySelectorAll('#gev-claude-chat').length,
     1,
+  );
+});
+
+test('Claude API mode asks for Claude and prices the message', async () => {
+  const { chat, chatBodies, statusProviders } = setup({
+    replies: [textReply('Chào')],
+  });
+  chat.shareRunner(async () => ({ ok: true }));
+  assert.equal(chat.ui.mode.value, 'claude');
+  assert.deepEqual(
+    [...chat.ui.mode.options].map((option) => option.value),
+    ['claude', 'free', 'local'],
+  );
+  await chat.send('chào');
+  assert.deepEqual(statusProviders, ['claude']);
+  assert.equal(chatBodies[0].provider, 'claude');
+  assert.match(chat.ui.usage.textContent, /≈ \$\d+\.\d{4} tin này/);
+});
+
+test('AI local mode runs on Ollama, costs nothing and explains the context size', async () => {
+  const { chat, chatBodies } = setup({
+    replies: [
+      { ...textReply('Xin chào'), model: 'qwen3:14b', provider: 'local' },
+    ],
+  });
+  chat.shareRunner(async () => ({ ok: true }));
+  pickMode(chat, 'local');
+  assert.equal(await chat.send('chào'), true);
+  assert.equal(chatBodies[0].provider, 'local');
+  assert.match(chat.ui.usage.textContent, /AI local: miễn phí/);
+  assert.doesNotMatch(chat.ui.usage.textContent, /\$/);
+  assert.match(chat.ui.note.textContent, /OLLAMA_CONTEXT_LENGTH=32768/);
+  assert.match(chat.ui.model.textContent, /AI local · qwen3:14b/);
+});
+
+test('free mode asks Gemini first and shows it as free', async () => {
+  const { chat, chatBodies } = setup({
+    replies: [
+      {
+        ...textReply('Chào từ Gemini'),
+        model: 'gemini-flash-latest',
+        provider: 'gemini',
+      },
+    ],
+  });
+  chat.shareRunner(async () => ({ ok: true }));
+  pickMode(chat, 'free');
+  await chat.send('chào');
+  assert.equal(chatBodies[0].provider, 'gemini');
+  assert.match(chat.ui.usage.textContent, /Gemini: \$0 với gói miễn phí/);
+});
+
+test('free mode moves to AI local when Gemini runs out and resends the message', async () => {
+  const { chat, chatBodies, statusProviders } = setup({
+    replies: [
+      {
+        httpStatus: 429,
+        body: { error: 'Quota exceeded', type: 'quota_exhausted' },
+      },
+      {
+        ...textReply('Đang bay tới Paris.'),
+        model: 'qwen3:14b',
+        provider: 'local',
+      },
+      { ...textReply('Vẫn local.'), model: 'qwen3:14b', provider: 'local' },
+      {
+        ...textReply('Gemini lại.'),
+        model: 'gemini-flash-latest',
+        provider: 'gemini',
+      },
+    ],
+  });
+  chat.shareRunner(async () => ({ ok: true }));
+  pickMode(chat, 'free');
+  assert.equal(await chat.send('bay tới Paris', { voice: true }), true);
+  assert.deepEqual(
+    chatBodies.map((body) => body.provider),
+    ['gemini', 'local'],
+  );
+  // The resent message starts a fresh local conversation, still marked as voice.
+  assert.deepEqual(chatBodies[1].messages, [
+    { role: 'user', content: 'bay tới Paris', voice: true },
+  ]);
+  const lines = [...chat.ui.log.children].map((line) => line.textContent);
+  assert.ok(lines.some((line) => /Gemini báo hết lượt miễn phí/.test(line)));
+  assert.equal(lines.at(-1), 'Đang bay tới Paris.');
+  assert.equal(chat.state.history.length, 2);
+
+  // Later messages in free mode stay on local...
+  await chat.send('tiếp');
+  assert.equal(chatBodies[2].provider, 'local');
+  // ...until "Miễn phí" is picked again.
+  pickMode(chat, 'free');
+  await chat.send('thử lại Gemini');
+  assert.equal(chatBodies[3].provider, 'gemini');
+  assert.equal(statusProviders.includes('local'), true);
+});
+
+test('free mode without GEMINI_API_KEY goes straight to AI local', async () => {
+  const { chat, chatBodies } = setup({
+    geminiConfigured: false,
+    replies: [{ ...textReply('local'), model: 'qwen3:14b', provider: 'local' }],
+  });
+  chat.shareRunner(async () => ({ ok: true }));
+  pickMode(chat, 'free');
+  await chat.send('chào');
+  assert.deepEqual(
+    chatBodies.map((body) => body.provider),
+    ['local'],
+  );
+  const lines = [...chat.ui.log.children].map((line) => line.textContent);
+  assert.ok(lines.some((line) => /Chưa có GEMINI_API_KEY/.test(line)));
+});
+
+test('a 429 in Claude API mode is reported, never moved to local', async () => {
+  const { chat, chatBodies } = setup({
+    replies: [
+      {
+        httpStatus: 429,
+        body: { error: 'Rate limited', type: 'rate_limit_error' },
+      },
+    ],
+  });
+  chat.shareRunner(async () => ({ ok: true }));
+  assert.equal(await chat.send('chào'), false);
+  assert.equal(chatBodies.length, 1);
+  const lines = [...chat.ui.log.children].map((line) => line.textContent);
+  assert.match(lines.at(-1), /^Lỗi: Rate limited \(HTTP 429\)/);
+});
+
+test('AI local mode says when Ollama is off or the model is missing', async () => {
+  const off = setup({ local: { reachable: false, installed: null } });
+  off.chat.shareRunner(async () => ({ ok: true }));
+  pickMode(off.chat, 'local');
+  assert.equal(await off.chat.send('chào'), false);
+  assert.equal(off.chatBodies.length, 0);
+  let lines = [...off.chat.ui.log.children].map((line) => line.textContent);
+  assert.match(
+    lines.at(-1),
+    /Không kết nối được Ollama tại http:\/\/localhost:11434/,
+  );
+
+  const missing = setup({ local: { reachable: true, installed: false } });
+  missing.chat.shareRunner(async () => ({ ok: true }));
+  pickMode(missing.chat, 'local');
+  assert.equal(await missing.chat.send('chào'), false);
+  lines = [...missing.chat.ui.log.children].map((line) => line.textContent);
+  assert.equal(
+    lines.at(-1),
+    'Máy chưa có model qwen3:14b. Chạy lệnh: ollama pull qwen3:14b',
+  );
+});
+
+test('switching from Claude to AI local clears the history', async () => {
+  const { chat, chatBodies } = setup({
+    replies: [
+      textReply('một'),
+      { ...textReply('hai'), model: 'qwen3:14b', provider: 'local' },
+    ],
+  });
+  chat.shareRunner(async () => ({ ok: true }));
+  await chat.send('lần 1');
+  pickMode(chat, 'local');
+  await chat.send('lần 2');
+  assert.deepEqual(chatBodies[1].messages, [
+    { role: 'user', content: 'lần 2' },
+  ]);
+  const lines = [...chat.ui.log.children].map((line) => line.textContent);
+  assert.ok(
+    lines.some((line) =>
+      line.startsWith(
+        'Đổi từ Claude claude-sonnet-5-5 sang AI local qwen3:14b',
+      ),
+    ),
   );
 });

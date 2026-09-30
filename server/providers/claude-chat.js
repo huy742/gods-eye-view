@@ -1,23 +1,32 @@
 import Anthropic from '@anthropic-ai/sdk';
+import { ApiError as GeminiApiError, GoogleGenAI } from '@google/genai';
 import { realtimeInstructions } from './openai/instructions.js';
 import { GEV_REALTIME_TOOLS } from './openai/tools.js';
 
 /**
- * Vite plugin: Claude chat panel (typed and spoken) for God's Eye View.
+ * Vite plugin: AI chat panel (typed and spoken) for God's Eye View.
  *
- * - GET  /api/claude/status reports the model, effort and output cap the proxy
- *   will use. It never returns the key.
- * - POST /api/claude/chat forwards a conversation to the Anthropic Messages API.
- *   ANTHROPIC_API_KEY stays on the server.
+ * The browser picks one of three providers per message:
+ * - claude: the Anthropic Messages API (paid); ANTHROPIC_API_KEY stays here.
+ * - gemini: the Google Gemini API free tier; GEMINI_API_KEY stays here. The
+ *   panel's "free" mode starts here and moves to local on a 429.
+ * - local:  an Ollama server through its Anthropic-compatible /v1/messages
+ *   endpoint. No key.
+ *
+ * - GET  /api/claude/status?provider=… reports the model, effort and output cap
+ *   the proxy will use. It never returns a key.
+ * - POST /api/claude/chat {provider, messages} always answers with one
+ *   Anthropic-shaped message, so the browser keeps a single tool loop.
  * - A `transform` hook patches src/voice/gevRealtime.js in memory (the file on
  *   disk is untouched) so the action runner built for the OpenAI voice agent is
- *   shared with the chat panel. Claude sees the same 30 tools.
+ *   shared with the chat panel. Every provider sees the same 30 tools.
  *
  * The browser half lives in `claudeChatClient`. It is serialized into a virtual
  * module with Function#toString, so it must not reference anything outside its
  * own body.
  */
 
+const CHAT_PROVIDERS = ['claude', 'gemini', 'local'];
 const CLAUDE_MODEL_DEFAULT = 'claude-sonnet-5-5';
 // Thinking tokens count toward max_tokens.
 const MAX_OUTPUT_TOKENS = 16000;
@@ -28,26 +37,58 @@ const CLAUDE_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 const CLAUDE_FALLBACK_MODELS = new Set(['claude-sonnet-5-5']);
 const CLAUDE_FALLBACK_BETA = 'server-side-fallback-2026-07-01';
 const CLAUDE_REQUEST_MAX_BYTES = 8 * 1024 * 1024;
+// Google's alias for its newest Flash model. Which models have free quota is
+// Google's decision; override with GEMINI_MODEL.
+const GEMINI_MODEL_DEFAULT = 'gemini-flash-latest';
+const OLLAMA_BASE_URL_DEFAULT = 'http://localhost:11434';
+// 9.3 GB and tool-capable in Ollama's library, leaving VRAM for a 32K context
+// on a 16 GB card. Override with OLLAMA_MODEL.
+const OLLAMA_MODEL_DEFAULT = 'qwen3:14b';
+const OLLAMA_MAX_TOKENS_DEFAULT = 8192;
+const OLLAMA_PROBE_TIMEOUT_MS = 1500;
+const GEMINI_REFUSALS = new Set([
+  'SAFETY',
+  'RECITATION',
+  'BLOCKLIST',
+  'PROHIBITED_CONTENT',
+  'SPII',
+]);
 
 // Appended to user turns that came from the microphone. It rides in the user
 // message, never in `system`, so the cached tools+system prefix stays identical.
 const VOICE_TURN_NOTE =
   '[Tin này đến từ giọng nói: trả lời ngắn 1–2 câu, không dùng markdown, không đọc JSON]';
 
-const CLAUDE_SYSTEM_PROMPT = [
-  "You are Claude, the assistant inside God's Eye View, a Cesium 3D globe app. The user talks to you in a chat panel, by typing or by voice.",
-  'Reply in the language the user writes in (usually Vietnamese or English).',
-  'You control the app only through the provided tools. The guidance below was written for the app\'s realtime voice agent and applies to you too: where it says "speak" or "say", it means your reply.',
-  'Typed messages may get short plain-text replies. A user message that ends with a note saying it came from voice gets one or two short sentences, with no markdown and no JSON.',
-  '',
-  realtimeInstructions(),
-].join('\n');
+function assistantSystemPrompt(opening) {
+  return [
+    `${opening} inside God's Eye View, a Cesium 3D globe app. The user talks to you in a chat panel, by typing or by voice.`,
+    'Reply in the language the user writes in (usually Vietnamese or English).',
+    'You control the app only through the provided tools. The guidance below was written for the app\'s realtime voice agent and applies to you too: where it says "speak" or "say", it means your reply.',
+    'Typed messages may get short plain-text replies. A user message that ends with a note saying it came from voice gets one or two short sentences, with no markdown and no JSON.',
+    '',
+    realtimeInstructions(),
+  ].join('\n');
+}
+
+const CLAUDE_SYSTEM_PROMPT = assistantSystemPrompt(
+  'You are Claude, the assistant',
+);
+// Gemini and local models are not Claude and should not say they are.
+const ASSISTANT_SYSTEM_PROMPT = assistantSystemPrompt('You are the assistant');
 
 const CLAUDE_TOOLS = GEV_REALTIME_TOOLS.map(
   ({ name, description, parameters }) => ({
     name,
     description,
     input_schema: parameters,
+  }),
+);
+
+const GEMINI_FUNCTIONS = GEV_REALTIME_TOOLS.map(
+  ({ name, description, parameters }) => ({
+    name,
+    description,
+    parametersJsonSchema: parameters,
   }),
 );
 
@@ -59,13 +100,19 @@ const SHARED_RUNNER_SITE =
 
 let warnedEffort = '';
 
-/** Read the model settings from the environment at request time. */
+function positiveInteger(value, fallback) {
+  const number = Number(String(value || '').trim());
+  return Number.isInteger(number) && number > 0 ? number : fallback;
+}
+
+/** Read the Claude settings from the environment at request time. */
 function resolveClaudeConfig(env = process.env) {
   const model =
     String(env.ANTHROPIC_MODEL || '').trim() || CLAUDE_MODEL_DEFAULT;
-  const tokens = Number(String(env.ANTHROPIC_MAX_TOKENS || '').trim());
-  const maxTokens =
-    Number.isInteger(tokens) && tokens > 0 ? tokens : MAX_OUTPUT_TOKENS;
+  const maxTokens = positiveInteger(
+    env.ANTHROPIC_MAX_TOKENS,
+    MAX_OUTPUT_TOKENS,
+  );
   const requested = String(env.ANTHROPIC_EFFORT || '')
     .trim()
     .toLowerCase();
@@ -85,6 +132,26 @@ function resolveClaudeConfig(env = process.env) {
     CLAUDE_FALLBACK_MODELS.has(model) &&
     !/^(0|false|off|no)$/i.test(String(env.ANTHROPIC_FALLBACKS || '').trim());
   return { model, maxTokens, effort, fallbacks };
+}
+
+function resolveGeminiConfig(env = process.env) {
+  return {
+    model: String(env.GEMINI_MODEL || '').trim() || GEMINI_MODEL_DEFAULT,
+    maxTokens: positiveInteger(env.GEMINI_MAX_TOKENS, MAX_OUTPUT_TOKENS),
+  };
+}
+
+function resolveLocalConfig(env = process.env) {
+  const baseURL =
+    String(env.OLLAMA_BASE_URL || '').trim() || OLLAMA_BASE_URL_DEFAULT;
+  return {
+    model: String(env.OLLAMA_MODEL || '').trim() || OLLAMA_MODEL_DEFAULT,
+    maxTokens: positiveInteger(
+      env.OLLAMA_MAX_TOKENS,
+      OLLAMA_MAX_TOKENS_DEFAULT,
+    ),
+    baseURL: baseURL.replace(/\/+$/, ''),
+  };
 }
 
 /** Validate browser history and apply the voice note to spoken user turns. */
@@ -128,6 +195,206 @@ function buildClaudeRequest(messages, config) {
       ? { betas: [CLAUDE_FALLBACK_BETA], fallbacks: 'default' }
       : {}),
   };
+}
+
+/** Ollama speaks the same Messages API, minus caching and fallbacks. */
+function buildLocalRequest(messages, config) {
+  return {
+    model: config.model,
+    max_tokens: config.maxTokens,
+    system: ASSISTANT_SYSTEM_PROMPT,
+    tools: CLAUDE_TOOLS,
+    messages: prepareClaudeMessages(messages),
+  };
+}
+
+function toolResultPayload(block) {
+  const text =
+    typeof block.content === 'string'
+      ? block.content
+      : Array.isArray(block.content)
+        ? block.content
+            .filter((part) => part?.type === 'text')
+            .map((part) => part.text)
+            .join('\n')
+        : '';
+  let value = text;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    // Plain-text results stay text.
+  }
+  const payload =
+    value && typeof value === 'object' && !Array.isArray(value)
+      ? value
+      : { result: value };
+  return block.is_error ? { error: payload } : payload;
+}
+
+/**
+ * Anthropic-shaped history → Gemini contents. Gemini's thought signatures and
+ * call ids ride on the blocks as gemini_* fields and go back unchanged.
+ */
+function toGeminiContents(messages) {
+  const calls = new Map();
+  const contents = [];
+  for (const { role, content } of messages) {
+    const blocks =
+      typeof content === 'string' ? [{ type: 'text', text: content }] : content;
+    const parts = [];
+    for (const block of blocks) {
+      const signature = block?.gemini_thought_signature
+        ? { thoughtSignature: block.gemini_thought_signature }
+        : {};
+      if (block?.type === 'text' && typeof block.text === 'string') {
+        if (block.text || signature.thoughtSignature)
+          parts.push({ text: block.text, ...signature });
+      } else if (block?.type === 'tool_use') {
+        calls.set(block.id, block);
+        parts.push({
+          functionCall: {
+            name: block.name,
+            args: block.input || {},
+            ...(block.gemini_call_id ? { id: block.gemini_call_id } : {}),
+          },
+          ...signature,
+        });
+      } else if (block?.type === 'tool_result') {
+        const call = calls.get(block.tool_use_id);
+        if (!call) continue;
+        parts.push({
+          functionResponse: {
+            name: call.name,
+            response: toolResultPayload(block),
+            ...(call.gemini_call_id ? { id: call.gemini_call_id } : {}),
+          },
+        });
+      }
+      // Thinking blocks from other providers have no Gemini form.
+    }
+    if (parts.length)
+      contents.push({ role: role === 'assistant' ? 'model' : 'user', parts });
+  }
+  return contents;
+}
+
+function buildGeminiRequest(messages, config) {
+  return {
+    model: config.model,
+    contents: toGeminiContents(prepareClaudeMessages(messages)),
+    config: {
+      systemInstruction: ASSISTANT_SYSTEM_PROMPT,
+      tools: [{ functionDeclarations: GEMINI_FUNCTIONS }],
+      maxOutputTokens: config.maxTokens,
+    },
+  };
+}
+
+/** Gemini response → the Anthropic-shaped message the browser loop expects. */
+function fromGeminiResponse(response, requestedModel) {
+  const usage = response?.usageMetadata || {};
+  const cached = usage.cachedContentTokenCount || 0;
+  const id = response?.responseId || `gemini_${Date.now()}`;
+  const message = {
+    id,
+    type: 'message',
+    role: 'assistant',
+    model: response?.modelVersion || requestedModel,
+    provider: 'gemini',
+    content: [],
+    stop_reason: 'end_turn',
+    stop_details: null,
+    usage: {
+      input_tokens: Math.max(0, (usage.promptTokenCount || 0) - cached),
+      output_tokens:
+        (usage.candidatesTokenCount || 0) + (usage.thoughtsTokenCount || 0),
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: cached,
+    },
+  };
+  const candidate = response?.candidates?.[0];
+  if (!candidate) {
+    message.stop_reason = 'refusal';
+    message.stop_details = {
+      type: 'refusal',
+      category: response?.promptFeedback?.blockReason || null,
+    };
+    return message;
+  }
+  let calls = 0;
+  for (const part of candidate.content?.parts || []) {
+    if (part.thought) continue;
+    const signature = part.thoughtSignature
+      ? { gemini_thought_signature: part.thoughtSignature }
+      : {};
+    if (part.functionCall) {
+      calls++;
+      const { id: callId, name, args } = part.functionCall;
+      message.content.push({
+        type: 'tool_use',
+        id: callId || `${id}_call_${calls}`,
+        name,
+        input: args || {},
+        ...(callId ? { gemini_call_id: callId } : {}),
+        ...signature,
+      });
+    } else if (typeof part.text === 'string' || part.thoughtSignature) {
+      message.content.push({
+        type: 'text',
+        text: part.text || '',
+        ...signature,
+      });
+    }
+  }
+  const finish = candidate.finishReason;
+  if (GEMINI_REFUSALS.has(finish)) {
+    message.stop_reason = 'refusal';
+    message.stop_details = { type: 'refusal', category: finish };
+  } else if (calls) {
+    message.stop_reason = 'tool_use';
+  } else if (finish === 'MAX_TOKENS') {
+    message.stop_reason = 'max_tokens';
+  } else if (finish === 'MALFORMED_FUNCTION_CALL') {
+    message.content.push({
+      type: 'text',
+      text: 'Gemini tạo lời gọi công cụ bị lỗi. Hãy thử nói lại yêu cầu.',
+    });
+  }
+  return message;
+}
+
+/** Gemini errors carry the upstream JSON after a status prefix. */
+function geminiErrorMessage(error) {
+  const text = String(error?.message || error);
+  const start = text.indexOf('{');
+  if (start >= 0) {
+    try {
+      const parsed = JSON.parse(text.slice(start));
+      if (parsed?.error?.message) return parsed.error.message;
+    } catch {
+      // Fall back to the raw message.
+    }
+  }
+  return text;
+}
+
+async function probeOllama({ baseURL, model }, fetchImpl) {
+  try {
+    const response = await fetchImpl(`${baseURL}/api/tags`, {
+      signal: AbortSignal.timeout(OLLAMA_PROBE_TIMEOUT_MS),
+    });
+    if (!response.ok) return { reachable: true, installed: null };
+    const { models = [] } = await response.json();
+    const names = models.flatMap((entry) => [entry?.name, entry?.model]);
+    return {
+      reachable: true,
+      installed:
+        names.includes(model) ||
+        (!model.includes(':') && names.includes(`${model}:latest`)),
+    };
+  } catch {
+    return { reachable: false, installed: null };
+  }
 }
 
 function sendJson(res, status, body) {
@@ -176,19 +443,54 @@ function readRequestBody(req, limit) {
   });
 }
 
-function createClaudeStatusHandler({ env = process.env } = {}) {
-  return (req, res) => {
+function createClaudeStatusHandler({
+  env = process.env,
+  fetchImpl = (...args) => fetch(...args),
+} = {}) {
+  return async (req, res) => {
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       sendJson(res, 405, { error: 'Method not allowed' });
       return;
     }
-    const { model, maxTokens, effort, fallbacks } = resolveClaudeConfig(env);
+    let requested = 'claude';
+    try {
+      requested =
+        new URL(req.url || '/', 'http://localhost').searchParams.get(
+          'provider',
+        ) || 'claude';
+    } catch {
+      // Keep the default.
+    }
+    const provider = CHAT_PROVIDERS.includes(requested) ? requested : 'claude';
+    const claude = resolveClaudeConfig(env);
+    const gemini = resolveGeminiConfig(env);
+    const local = resolveLocalConfig(env);
+    const providers = {
+      claude: {
+        configured: Boolean(env.ANTHROPIC_API_KEY),
+        model: claude.model,
+      },
+      gemini: { configured: Boolean(env.GEMINI_API_KEY), model: gemini.model },
+      local: { configured: true, model: local.model, baseURL: local.baseURL },
+    };
+    if (provider === 'local')
+      Object.assign(providers.local, await probeOllama(local, fetchImpl));
+    const settings =
+      provider === 'claude'
+        ? claude
+        : {
+            ...(provider === 'gemini' ? gemini : local),
+            effort: null,
+            fallbacks: false,
+          };
     sendJson(res, 200, {
-      configured: Boolean(env.ANTHROPIC_API_KEY),
-      model,
-      maxTokens,
-      effort,
-      fallbacks,
+      provider,
+      configured: providers[provider].configured,
+      model: settings.model,
+      maxTokens: settings.maxTokens,
+      effort: settings.effort,
+      fallbacks: settings.fallbacks,
+      providers,
     });
   };
 }
@@ -196,16 +498,14 @@ function createClaudeStatusHandler({ env = process.env } = {}) {
 function createClaudeChatHandler({
   env = process.env,
   baseURL,
+  geminiBaseURL,
   createClient = (options) => new Anthropic(options),
+  createGeminiClient = (options) => new GoogleGenAI(options),
 } = {}) {
-  let client = null;
-  let clientKey = '';
-  const clientFor = (apiKey) => {
-    if (!client || clientKey !== apiKey) {
-      client = createClient({ apiKey, ...(baseURL ? { baseURL } : {}) });
-      clientKey = apiKey;
-    }
-    return client;
+  const clients = new Map();
+  const cachedClient = (key, make) => {
+    if (!clients.has(key)) clients.set(key, make());
+    return clients.get(key);
   };
 
   return async (req, res) => {
@@ -221,18 +521,30 @@ function createClaudeChatHandler({
       sendJson(res, 415, { error: 'Content-Type must be application/json' });
       return;
     }
-    const apiKey = env.ANTHROPIC_API_KEY;
-    if (!apiKey) {
-      sendJson(res, 503, { error: 'ANTHROPIC_API_KEY is not set' });
-      return;
-    }
 
-    let params;
+    let provider;
+    let call;
     try {
       const body = JSON.parse(
         await readRequestBody(req, CLAUDE_REQUEST_MAX_BYTES),
       );
-      params = buildClaudeRequest(body?.messages, resolveClaudeConfig(env));
+      provider = body?.provider ?? 'claude';
+      if (!CHAT_PROVIDERS.includes(provider))
+        throw new TypeError(`Unknown provider: ${provider}`);
+      const keyName =
+        provider === 'claude'
+          ? 'ANTHROPIC_API_KEY'
+          : provider === 'gemini'
+            ? 'GEMINI_API_KEY'
+            : null;
+      if (keyName && !env[keyName]) {
+        sendJson(res, 503, {
+          error: `${keyName} is not set`,
+          type: 'not_configured',
+        });
+        return;
+      }
+      call = prepareProviderCall(provider, body?.messages);
     } catch (error) {
       sendJson(res, error.status || 400, {
         error:
@@ -246,25 +558,104 @@ function createClaudeChatHandler({
       if (!res.writableEnded) abort.abort();
     });
     try {
-      // Streamed upstream so a large max_tokens cannot hit the SDK's
-      // non-streaming timeout; the browser still gets one complete message.
-      const message = await clientFor(apiKey)
-        .beta.messages.stream(params, { signal: abort.signal })
-        .finalMessage();
-      sendJson(res, 200, message);
+      sendJson(res, 200, await call(abort.signal));
     } catch (error) {
       if (abort.signal.aborted) return;
-      if (error instanceof Anthropic.APIError && error.status) {
-        sendJson(res, error.status, {
-          error: error.error?.error?.message || error.message,
-          type: error.error?.error?.type,
-        });
-        return;
-      }
-      console.warn('[claude-chat] Anthropic request failed');
-      sendJson(res, 502, { error: 'Could not reach the Anthropic API' });
+      const [status, body] = providerError(provider, error);
+      if (status >= 500)
+        console.warn(`[claude-chat] ${provider} request failed`);
+      sendJson(res, status, body);
     }
   };
+
+  /** Validate and build the request now; return the network call for later. */
+  function prepareProviderCall(provider, messages) {
+    if (provider === 'claude') {
+      const apiKey = env.ANTHROPIC_API_KEY;
+      const params = buildClaudeRequest(messages, resolveClaudeConfig(env));
+      const client = cachedClient(`claude:${apiKey}`, () =>
+        createClient({ apiKey, ...(baseURL ? { baseURL } : {}) }),
+      );
+      // Streamed upstream so a large max_tokens cannot hit the SDK's
+      // non-streaming timeout; the browser still gets one complete message.
+      return async (signal) => ({
+        ...(await client.beta.messages
+          .stream(params, { signal })
+          .finalMessage()),
+        provider,
+      });
+    }
+    if (provider === 'local') {
+      const config = resolveLocalConfig(env);
+      const params = buildLocalRequest(messages, config);
+      const client = cachedClient(`local:${config.baseURL}`, () =>
+        // Ollama ignores the key. No retries: a stopped server should say so
+        // at once.
+        createClient({
+          apiKey: 'ollama',
+          baseURL: config.baseURL,
+          maxRetries: 0,
+        }),
+      );
+      return async (signal) => ({
+        ...(await client.messages.stream(params, { signal }).finalMessage()),
+        provider,
+      });
+    }
+    const apiKey = env.GEMINI_API_KEY;
+    const config = resolveGeminiConfig(env);
+    const request = buildGeminiRequest(messages, config);
+    const client = cachedClient(`gemini:${apiKey}`, () =>
+      createGeminiClient({
+        apiKey,
+        ...(geminiBaseURL ? { httpOptions: { baseUrl: geminiBaseURL } } : {}),
+      }),
+    );
+    return async (signal) =>
+      fromGeminiResponse(
+        await client.models.generateContent({
+          ...request,
+          config: { ...request.config, abortSignal: signal },
+        }),
+        config.model,
+      );
+  }
+
+  function providerError(provider, error) {
+    if (provider === 'gemini') {
+      if (error instanceof GeminiApiError && error.status) {
+        const message = geminiErrorMessage(error);
+        // Free-tier quota (per minute or per day) is spent.
+        if (error.status === 429)
+          return [429, { error: message, type: 'quota_exhausted' }];
+        return [error.status, { error: message }];
+      }
+      return [502, { error: 'Could not reach the Gemini API' }];
+    }
+    if (error instanceof Anthropic.APIError && error.status) {
+      return [
+        error.status,
+        {
+          error:
+            error.error?.error?.message ||
+            error.error?.message ||
+            error.message,
+          type: error.error?.error?.type,
+        },
+      ];
+    }
+    if (provider === 'local') {
+      const { baseURL: localURL } = resolveLocalConfig(env);
+      return [
+        502,
+        {
+          error: `Không kết nối được Ollama tại ${localURL}. Hãy mở Ollama rồi thử lại.`,
+          type: 'local_unreachable',
+        },
+      ];
+    }
+    return [502, { error: 'Could not reach the Anthropic API' }];
+  }
 }
 
 /** Share the runner built in gevRealtime.js with the chat panel. */
@@ -340,6 +731,22 @@ function claudeChatClient(win) {
     ['vi-VN', 'Tiếng Việt'],
     ['en-US', 'English'],
   ];
+  // "free" asks Gemini first and moves to the local model once Gemini reports
+  // its free quota spent (HTTP 429). Picking "free" again retries Gemini.
+  const MODES = [
+    ['claude', 'Claude API (trả phí)'],
+    ['free', 'Miễn phí: Gemini → AI local'],
+    ['local', 'AI local (Ollama)'],
+  ];
+  const PROVIDER_LABELS = {
+    claude: 'Claude',
+    gemini: 'Gemini',
+    local: 'AI local',
+  };
+  const FREE_LABELS = {
+    gemini: 'Gemini: $0 với gói miễn phí',
+    local: 'AI local: miễn phí',
+  };
   const CSS = `
 #gev-claude-chat{position:fixed;left:16px;bottom:16px;z-index:1200;font:13px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;color:#e6edf3}
 #gev-claude-chat button,#gev-claude-chat select,#gev-claude-chat textarea{font:inherit;color:inherit}
@@ -349,7 +756,8 @@ function claudeChatClient(win) {
 .gev-claude-panel[hidden]{display:none}
 .gev-claude-head{display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid #263041}
 .gev-claude-title{font-weight:600}
-.gev-claude-model{flex:1;opacity:.65;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.gev-claude-model{padding:4px 10px 0;opacity:.65;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.gev-claude-mode{flex:1;min-width:0;background:#1b2230;border:1px solid #3b4a63;border-radius:6px;padding:2px 4px}
 .gev-claude-head button{background:none;border:1px solid transparent;border-radius:6px;padding:2px 8px;cursor:pointer}
 .gev-claude-head button:hover{border-color:#3b4a63}
 .gev-claude-log{flex:1;min-height:120px;overflow-y:auto;padding:8px 10px;display:flex;flex-direction:column;gap:6px}
@@ -377,6 +785,11 @@ function claudeChatClient(win) {
     runner: null,
     history: [],
     model: null,
+    modelLabel: '',
+    mode: MODES.some(([value]) => value === readPref('mode', ''))
+      ? readPref('mode', '')
+      : 'claude',
+    geminiSpent: false,
     busy: false,
     abort: null,
     listening: false,
@@ -389,7 +802,7 @@ function claudeChatClient(win) {
     sessionCost: 0,
     sessionPriced: true,
   };
-  const notes = { support: [], tools: '', voice: '' };
+  const notes = { support: [], tools: '', provider: '', voice: '' };
   let ui = null;
 
   function readPref(key, fallback) {
@@ -450,9 +863,15 @@ function claudeChatClient(win) {
       class: 'gev-claude-toggle',
       'aria-expanded': 'false',
       'aria-controls': 'gev-claude-panel',
-      text: 'Claude',
+      text: 'Chat AI',
     });
-    const model = el('span', { class: 'gev-claude-model' });
+    const mode = el(
+      'select',
+      { class: 'gev-claude-mode', 'aria-label': 'Chọn AI' },
+      MODES.map(([value, label]) => el('option', { value, text: label })),
+    );
+    mode.value = state.mode;
+    const model = el('div', { class: 'gev-claude-model' });
     const clear = el('button', {
       type: 'button',
       class: 'gev-claude-clear',
@@ -479,8 +898,8 @@ function claudeChatClient(win) {
     const input = el('textarea', {
       class: 'gev-claude-input',
       rows: 2,
-      'aria-label': 'Tin nhắn cho Claude',
-      placeholder: 'Nhắn cho Claude… (Enter để gửi, Shift+Enter xuống dòng)',
+      'aria-label': 'Tin nhắn cho AI',
+      placeholder: 'Nhắn cho AI… (Enter để gửi, Shift+Enter xuống dòng)',
     });
     const mic = el('button', {
       type: 'button',
@@ -521,16 +940,17 @@ function claudeChatClient(win) {
       {
         id: 'gev-claude-panel',
         class: 'gev-claude-panel',
-        'aria-label': 'Chat với Claude',
+        'aria-label': 'Chat với AI',
         hidden: true,
       },
       [
         el('div', { class: 'gev-claude-head' }, [
-          el('span', { class: 'gev-claude-title', text: 'Claude' }),
-          model,
+          el('span', { class: 'gev-claude-title', text: 'Chat AI' }),
+          mode,
           clear,
           close,
         ]),
+        model,
         log,
         interim,
         note,
@@ -543,6 +963,7 @@ function claudeChatClient(win) {
       root,
       toggle,
       panel,
+      mode,
       model,
       clear,
       close,
@@ -567,6 +988,12 @@ function claudeChatClient(win) {
     });
     mic.addEventListener('click', toggleMic);
     speak.addEventListener('click', toggleSpeak);
+    mode.addEventListener('change', () => {
+      state.mode = mode.value;
+      state.geminiSpent = false;
+      writePref('mode', state.mode);
+      refreshStatus();
+    });
     lang.addEventListener('change', () => {
       state.lang = lang.value;
       writePref('lang', state.lang);
@@ -596,7 +1023,12 @@ function claudeChatClient(win) {
 
   function renderNote() {
     if (!ui) return;
-    ui.note.textContent = [...notes.support, notes.tools, notes.voice]
+    ui.note.textContent = [
+      ...notes.support,
+      notes.tools,
+      notes.provider,
+      notes.voice,
+    ]
       .filter(Boolean)
       .join('\n');
   }
@@ -613,12 +1045,41 @@ function claudeChatClient(win) {
     }
   }
 
+  function providerForMode() {
+    if (state.mode === 'free') return state.geminiSpent ? 'local' : 'gemini';
+    return state.mode;
+  }
+
+  function localProblem(status) {
+    const local = status.providers?.local || {};
+    if (local.reachable === false)
+      return `Không kết nối được Ollama tại ${local.baseURL}. Hãy mở Ollama rồi thử lại.`;
+    if (local.installed === false)
+      return `Máy chưa có model ${status.model}. Chạy lệnh: ollama pull ${status.model}`;
+    return '';
+  }
+
+  function showProvider(status) {
+    const provider = status.provider || providerForMode();
+    const label = `${PROVIDER_LABELS[provider] || provider} · ${status.model}`;
+    let problem = '';
+    if (!status.configured)
+      problem =
+        provider === 'gemini'
+          ? 'chưa có GEMINI_API_KEY, sẽ dùng AI local'
+          : 'chưa có ANTHROPIC_API_KEY';
+    else if (provider === 'local') problem = localProblem(status);
+    ui.model.textContent = problem ? `${label} (${problem})` : label;
+    notes.provider =
+      provider === 'local'
+        ? 'AI local: đặt OLLAMA_CONTEXT_LENGTH=32768 cho Ollama, vì hướng dẫn và 30 công cụ của app dài khoảng 14 nghìn token (Ollama mặc định chỉ đọc 4096).'
+        : '';
+    renderNote();
+  }
+
   async function refreshStatus() {
     try {
-      const status = await fetchStatus();
-      ui.model.textContent = status.configured
-        ? status.model
-        : 'chưa có ANTHROPIC_API_KEY';
+      showProvider(await fetchStatus(providerForMode()));
     } catch {
       ui.model.textContent = 'không kết nối được server';
     }
@@ -678,8 +1139,9 @@ function claudeChatClient(win) {
     send(text);
   }
 
-  async function fetchStatus(signal) {
-    const response = await win.fetch('/api/claude/status', {
+  async function fetchStatus(provider, signal) {
+    const url = `/api/claude/status?provider=${encodeURIComponent(provider)}`;
+    const response = await win.fetch(url, {
       signal,
       headers: { Accept: 'application/json' },
     });
@@ -688,12 +1150,12 @@ function claudeChatClient(win) {
     return response.json();
   }
 
-  async function postChat(messages, signal) {
+  async function postChat(messages, provider, signal) {
     const response = await win.fetch('/api/claude/chat', {
       method: 'POST',
       signal,
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages }),
+      body: JSON.stringify({ provider, messages }),
     });
     let data = null;
     try {
@@ -702,10 +1164,13 @@ function claudeChatClient(win) {
       data = null;
     }
     if (!response.ok)
-      throw new Error(
-        data?.error
-          ? `${data.error} (HTTP ${response.status})`
-          : `HTTP ${response.status}`,
+      throw Object.assign(
+        new Error(
+          data?.error
+            ? `${data.error} (HTTP ${response.status})`
+            : `HTTP ${response.status}`,
+        ),
+        { status: response.status, type: data?.type },
       );
     if (!data || !Array.isArray(data.content))
       throw new Error('Phản hồi không hợp lệ từ /api/claude/chat');
@@ -761,11 +1226,13 @@ function claudeChatClient(win) {
     return Number(value || 0).toLocaleString('en-US');
   }
 
-  function showUsage(usage, priced, cost) {
+  function showUsage(usage, priced, cost, freeLabel) {
     const parts = [
       `Token: vào ${formatCount(usage.input)} · ra ${formatCount(usage.output)} · cache ghi ${formatCount(usage.cacheWrite)} · cache đọc ${formatCount(usage.cacheRead)}`,
     ];
-    if (priced) {
+    if (freeLabel) {
+      parts.push(freeLabel);
+    } else if (priced) {
       parts.push(
         `≈ $${cost.toFixed(4)} tin này` +
           (state.sessionPriced
@@ -787,10 +1254,25 @@ function claudeChatClient(win) {
     const usage = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
     let cost = 0;
     let priced = true;
+    let freeLabel = '';
     let requests = 0;
     let checkpoint = state.history.length;
+    let provider = providerForMode();
+    let outcome = false;
+    let retryOnLocal = false;
     try {
-      const status = await fetchStatus(controller.signal);
+      let status = await fetchStatus(provider, controller.signal);
+      if (provider === 'gemini' && !status.configured) {
+        state.geminiSpent = true;
+        addLine(
+          'system',
+          'Chưa có GEMINI_API_KEY nên chế độ miễn phí dùng AI local.',
+        );
+        provider = 'local';
+        status = await fetchStatus(provider, controller.signal);
+      }
+      provider = status.provider || provider;
+      showProvider(status);
       if (!status.configured) {
         addLine(
           'system',
@@ -798,16 +1280,23 @@ function claudeChatClient(win) {
         );
         return false;
       }
-      // Thinking blocks are bound to the model that wrote them.
-      if (state.model && status.model !== state.model && state.history.length) {
+      if (provider === 'local' && localProblem(status)) {
+        addLine('system', localProblem(status));
+        return false;
+      }
+      // Thinking blocks are bound to the model that wrote them, and each
+      // provider keeps its own block format.
+      const identity = `${provider}:${status.model}`;
+      const identityLabel = `${PROVIDER_LABELS[provider] || provider} ${status.model}`;
+      if (state.model && identity !== state.model && state.history.length) {
         state.history = [];
         addLine(
           'system',
-          `Model đổi từ ${state.model} sang ${status.model}: đã xoá lịch sử hội thoại.`,
+          `Đổi từ ${state.modelLabel} sang ${identityLabel}: đã xoá lịch sử hội thoại.`,
         );
       }
-      state.model = status.model;
-      ui.model.textContent = status.model;
+      state.model = identity;
+      state.modelLabel = identityLabel;
       checkpoint = state.history.length;
 
       addLine('user', voice ? `🎤 ${text}` : text);
@@ -818,7 +1307,11 @@ function claudeChatClient(win) {
       );
       let finalText = '';
       for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-        const message = await postChat(state.history, controller.signal);
+        const message = await postChat(
+          state.history,
+          provider,
+          controller.signal,
+        );
         requests++;
         const used = message.usage || {};
         const turnUsage = {
@@ -828,8 +1321,11 @@ function claudeChatClient(win) {
           cacheRead: used.cache_read_input_tokens || 0,
         };
         for (const key of Object.keys(usage)) usage[key] += turnUsage[key];
+        const servedBy = message.provider || provider;
         const price = PRICES[message.model] || PRICES[status.model];
-        if (price) {
+        if (FREE_LABELS[servedBy]) {
+          freeLabel = FREE_LABELS[servedBy];
+        } else if (price) {
           cost +=
             (turnUsage.input * price.input +
               turnUsage.output * price.output +
@@ -845,7 +1341,7 @@ function claudeChatClient(win) {
           const category = message.stop_details?.category;
           addLine(
             'system',
-            `Claude từ chối yêu cầu này${category ? ` (${category})` : ''}. Tin này không được lưu vào lịch sử.`,
+            `${PROVIDER_LABELS[servedBy] || servedBy} từ chối yêu cầu này${category ? ` (${category})` : ''}. Tin này không được lưu vào lịch sử.`,
           );
           finalText = '';
           break;
@@ -875,25 +1371,42 @@ function claudeChatClient(win) {
           addLine('system', `Dừng sau ${MAX_TOOL_ROUNDS} vòng gọi công cụ.`);
       }
       if (finalText && state.speak) speakText(finalText);
-      return true;
+      outcome = true;
     } catch (error) {
       state.history.length = checkpoint;
-      addLine(
-        'system',
-        error?.name === 'AbortError'
-          ? 'Đã dừng. Tin này không được lưu vào lịch sử.'
-          : `Lỗi: ${error?.message || error}. Tin này không được lưu vào lịch sử.`,
-      );
-      return false;
+      if (
+        error?.type === 'quota_exhausted' &&
+        provider === 'gemini' &&
+        state.mode === 'free'
+      ) {
+        state.geminiSpent = true;
+        retryOnLocal = true;
+        addLine(
+          'system',
+          'Gemini báo hết lượt miễn phí. Đã chuyển sang AI local và gửi lại tin này. Chọn lại "Miễn phí" để thử Gemini lần nữa.',
+        );
+      } else {
+        addLine(
+          'system',
+          error?.name === 'AbortError'
+            ? 'Đã dừng. Tin này không được lưu vào lịch sử.'
+            : `Lỗi: ${error?.message || error}. Tin này không được lưu vào lịch sử.`,
+        );
+      }
     } finally {
       if (requests) {
-        if (priced) state.sessionCost += cost;
-        else state.sessionPriced = false;
-        showUsage(usage, priced, cost);
+        // Free providers add nothing to the session cost.
+        if (!freeLabel) {
+          if (priced) state.sessionCost += cost;
+          else state.sessionPriced = false;
+        }
+        showUsage(usage, priced, cost, freeLabel);
       }
       state.abort = null;
       setBusy(false);
     }
+    if (retryOnLocal) return send(text, { voice });
+    return outcome;
   }
 
   // ---- Microphone -------------------------------------------------------
@@ -1098,22 +1611,33 @@ function claudeChatClient(win) {
 }
 
 export {
+  ASSISTANT_SYSTEM_PROMPT,
+  CHAT_PROVIDERS,
   CLAUDE_EFFORTS,
   CLAUDE_FALLBACK_BETA,
   CLAUDE_MODEL_DEFAULT,
   CLAUDE_SYSTEM_PROMPT,
   CLAUDE_TOOLS,
+  GEMINI_MODEL_DEFAULT,
   MAX_OUTPUT_TOKENS,
+  OLLAMA_BASE_URL_DEFAULT,
+  OLLAMA_MODEL_DEFAULT,
   RESOLVED_VIRTUAL_ID,
   VIRTUAL_ID,
   VOICE_TURN_NOTE,
   buildClaudeRequest,
+  buildGeminiRequest,
+  buildLocalRequest,
   claudeChatClient,
   claudeChatModuleSource,
   claudeChatPlugin,
   createClaudeChatHandler,
   createClaudeStatusHandler,
+  fromGeminiResponse,
   patchGevRealtime,
   prepareClaudeMessages,
   resolveClaudeConfig,
+  resolveGeminiConfig,
+  resolveLocalConfig,
+  toGeminiContents,
 };
