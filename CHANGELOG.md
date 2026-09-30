@@ -17,7 +17,10 @@
   moving to AI local when Gemini answers 429), or **AI local** (Ollama's
   Anthropic-compatible API, default model `qwen3:14b`). `npm run
   setup:local-ai` checks Ollama, pulls the model and sets
-  `OLLAMA_CONTEXT_LENGTH=32768`.
+  `OLLAMA_CONTEXT_LENGTH=32768`. Every tool call is checked against its
+  schema before it runs; a bad call is returned to the model with the reason
+  instead of reaching the map. A waiting line counts seconds while a reply is
+  pending.
 
 - Public Overpass instances are no longer used by default. Street Traffic
   roads come from TomTom flow tiles, OpenFreeMap vector tiles, or both, chosen

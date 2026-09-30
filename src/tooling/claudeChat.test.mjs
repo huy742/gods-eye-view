@@ -476,6 +476,14 @@ test('transform shares the voice runner without touching other files', () => {
   assert.equal(plugin.resolveId('other'), null);
   const moduleSource = plugin.load(RESOLVED_VIRTUAL_ID);
   assert.match(moduleSource, /export const shareRunner = chat\.shareRunner;/);
+  // The browser gets every tool schema to check calls before running them.
+  const schemas = JSON.parse(
+    moduleSource.match(/\{ toolSchemas: (\{.*\}) \}\);/)[1],
+  );
+  assert.deepEqual(
+    Object.keys(schemas).sort(),
+    CLAUDE_TOOLS.map((t) => t.name).sort(),
+  );
   assert.equal(plugin.load('other'), null);
 });
 

@@ -2,7 +2,14 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { JSDOM } from 'jsdom';
 
-import { claudeChatClient } from '../../server/providers/claude-chat.js';
+import {
+  CLAUDE_TOOLS,
+  claudeChatClient,
+} from '../../server/providers/claude-chat.js';
+
+const TOOL_SCHEMAS = Object.fromEntries(
+  CLAUDE_TOOLS.map(({ name, input_schema }) => [name, input_schema]),
+);
 
 const textReply = (text, usage = {}) => ({
   model: 'claude-sonnet-5-5',
@@ -44,6 +51,7 @@ function setup({
   replies = [],
   geminiConfigured = true,
   local = { reachable: true, installed: true },
+  toolSchemas = null,
 } = {}) {
   const dom = new JSDOM(
     '<!doctype html><html><head></head><body></body></html>',
@@ -79,7 +87,8 @@ function setup({
       return { ok: true, status: 200, json: async () => body };
     }
     chatBodies.push(JSON.parse(init.body));
-    const reply = queue.shift() || textReply('ok');
+    const next = queue.shift() || textReply('ok');
+    const reply = typeof next === 'function' ? await next() : next;
     if (reply.httpStatus)
       return {
         ok: false,
@@ -128,7 +137,7 @@ function setup({
   // Evaluated inside the jsdom realm, as the browser runs the virtual module:
   // any reference to this file's module scope would throw here.
   const createClaudeChat = win.eval(`(${claudeChatClient.toString()})`);
-  const chat = createClaudeChat(win);
+  const chat = createClaudeChat(win, { toolSchemas });
   return {
     win,
     chat,
@@ -590,4 +599,111 @@ test('switching from Claude to AI local clears the history', async () => {
       ),
     ),
   );
+});
+
+test('tool calls with wrong arguments never reach the map', async () => {
+  const bad = {
+    model: 'claude-sonnet-5-5',
+    content: [
+      {
+        type: 'tool_use',
+        id: 'toolu_bad',
+        name: 'fly_to_location',
+        input: { locationId: 'hanoi', rangeM: 5 },
+      },
+      { type: 'tool_use', id: 'toolu_ghost', name: 'fly_to_mars', input: {} },
+    ],
+    stop_reason: 'tool_use',
+    usage: { input_tokens: 10, output_tokens: 5 },
+  };
+  const { chat, chatBodies } = setup({
+    toolSchemas: TOOL_SCHEMAS,
+    replies: [
+      bad,
+      toolReply('fly_to_location', { query: 'Hà Nội' }),
+      textReply('Đã tới.'),
+    ],
+  });
+  const runs = [];
+  chat.shareRunner(async (name, args) => {
+    runs.push([name, args]);
+    return { ok: true };
+  });
+  await chat.send('bay tới Hà Nội');
+
+  // Only the schema-valid retry ran.
+  assert.deepEqual(runs, [['fly_to_location', { query: 'Hà Nội' }]]);
+  const [enumError, unknown] = chatBodies[1].messages.at(-1).content;
+  assert.equal(enumError.is_error, true);
+  assert.match(
+    enumError.content,
+    /fly_to_location\.locationId must be one of: austin/,
+  );
+  assert.match(enumError.content, /fly_to_location\.rangeM must be >= 100/);
+  assert.equal(unknown.is_error, true);
+  assert.match(unknown.content, /unknown tool \\"fly_to_mars\\"/);
+  const lines = [...chat.ui.log.children].map((line) => line.textContent);
+  assert.ok(lines.some((line) => line.endsWith('→ chặn (sai tham số)')));
+});
+
+test('the tool check accepts valid calls and reports missing required fields', async () => {
+  const { chat, chatBodies } = setup({
+    toolSchemas: TOOL_SCHEMAS,
+    replies: [
+      {
+        model: 'claude-sonnet-5-5',
+        content: [
+          { type: 'tool_use', id: 't1', name: 'zoom_to_globe', input: {} },
+          {
+            type: 'tool_use',
+            id: 't2',
+            name: 'set_layer_visibility',
+            input: {},
+          },
+        ],
+        stop_reason: 'tool_use',
+        usage: {},
+      },
+      textReply('ok'),
+    ],
+  });
+  const runs = [];
+  chat.shareRunner(async (name) => {
+    runs.push(name);
+    return { ok: true };
+  });
+  await chat.send('toàn cầu');
+  assert.deepEqual(runs, ['zoom_to_globe']);
+  const [, missing] = chatBodies[1].messages.at(-1).content;
+  assert.match(missing.content, /set_layer_visibility\.\w+ is required/);
+});
+
+test('a waiting line counts seconds and clears when the reply lands', async () => {
+  let release;
+  const pending = new Promise((resolve) => {
+    release = resolve;
+  });
+  const { chat } = setup({
+    replies: [
+      () =>
+        pending.then(() => ({
+          ...textReply('xong'),
+          model: 'qwen3:14b',
+          provider: 'local',
+        })),
+    ],
+  });
+  chat.shareRunner(async () => ({ ok: true }));
+  pickMode(chat, 'local');
+  const sending = chat.send('chào');
+  await settle(() => chat.ui.wait.textContent !== '', 'waiting line');
+  assert.match(
+    chat.ui.wait.textContent,
+    /^⏳ Đang chờ AI local… 0 giây \(có thể đang nạp model vào VRAM\)$/,
+  );
+  // The panel stays usable while waiting: the button stops the request.
+  assert.equal(chat.ui.send.textContent, 'Dừng');
+  release();
+  assert.equal(await sending, true);
+  assert.equal(chat.ui.wait.textContent, '');
 });

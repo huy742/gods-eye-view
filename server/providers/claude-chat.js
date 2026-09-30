@@ -667,10 +667,15 @@ function patchGevRealtime(code) {
   return `${header}${code}\n__gevClaudeShareRunner(null);\n`;
 }
 
+// The browser checks every tool call against these before it can reach the map.
+const TOOL_SCHEMAS = Object.fromEntries(
+  CLAUDE_TOOLS.map(({ name, input_schema }) => [name, input_schema]),
+);
+
 function claudeChatModuleSource() {
   return [
     `const createClaudeChat = ${claudeChatClient.toString()};`,
-    'const chat = createClaudeChat(globalThis);',
+    `const chat = createClaudeChat(globalThis, { toolSchemas: ${JSON.stringify(TOOL_SCHEMAS)} });`,
     'export const shareRunner = chat.shareRunner;',
     '',
   ].join('\n');
@@ -713,7 +718,7 @@ function claudeChatPlugin(options = {}) {
  * Browser half: chat panel, microphone (SpeechRecognition) and read-aloud
  * (speechSynthesis). Self-contained on purpose; see the file header.
  */
-function claudeChatClient(win) {
+function claudeChatClient(win, { toolSchemas = null } = {}) {
   const doc = win.document;
   const STORAGE_PREFIX = 'gev.claudeChat.';
   const MAX_TOOL_ROUNDS = 10;
@@ -769,7 +774,8 @@ function claudeChatClient(win) {
 .gev-claude-interim{padding:0 10px 6px;font-style:italic;opacity:.8}
 .gev-claude-note{padding:0 10px 6px;font-size:12px;color:#f5c26b}
 .gev-claude-usage{padding:4px 10px;font-size:11px;opacity:.7;border-top:1px solid #263041}
-.gev-claude-interim:empty,.gev-claude-note:empty,.gev-claude-usage:empty{display:none}
+.gev-claude-wait{padding:0 10px 6px;font-size:12px;opacity:.8}
+.gev-claude-interim:empty,.gev-claude-wait:empty,.gev-claude-note:empty,.gev-claude-usage:empty{display:none}
 .gev-claude-form{display:flex;flex-direction:column;gap:6px;padding:8px 10px;border-top:1px solid #263041}
 .gev-claude-input{resize:vertical;min-height:38px;max-height:160px;background:#0b0f16;border:1px solid #3b4a63;border-radius:6px;padding:6px 8px}
 .gev-claude-controls{display:flex;gap:6px;align-items:center}
@@ -790,6 +796,7 @@ function claudeChatClient(win) {
       ? readPref('mode', '')
       : 'claude',
     geminiSpent: false,
+    lastLocalReply: 0,
     busy: false,
     abort: null,
     listening: false,
@@ -893,6 +900,7 @@ function claudeChatClient(win) {
       class: 'gev-claude-interim',
       'aria-live': 'polite',
     });
+    const wait = el('div', { class: 'gev-claude-wait', role: 'status' });
     const note = el('div', { class: 'gev-claude-note', role: 'status' });
     const usage = el('div', { class: 'gev-claude-usage' });
     const input = el('textarea', {
@@ -952,6 +960,7 @@ function claudeChatClient(win) {
         ]),
         model,
         log,
+        wait,
         interim,
         note,
         usage,
@@ -968,6 +977,7 @@ function claudeChatClient(win) {
       clear,
       close,
       log,
+      wait,
       interim,
       note,
       usage,
@@ -1061,7 +1071,7 @@ function claudeChatClient(win) {
 
   function showProvider(status) {
     const provider = status.provider || providerForMode();
-    const label = `${PROVIDER_LABELS[provider] || provider} · ${status.model}`;
+    const label = `${PROVIDER_LABELS[provider] || provider} · ${status.model}${status.effort ? ` · effort ${status.effort}` : ''}`;
     let problem = '';
     if (!status.configured)
       problem =
@@ -1189,6 +1199,94 @@ function claudeChatClient(win) {
       : text;
   }
 
+  // JSON Schema check covering the keywords the app's tool schemas use.
+  function schemaErrors(schema, value, path) {
+    if (!schema || typeof schema !== 'object') return [];
+    const kind =
+      value === null
+        ? 'null'
+        : Array.isArray(value)
+          ? 'array'
+          : Number.isInteger(value)
+            ? 'integer'
+            : typeof value;
+    const types = [].concat(schema.type || []);
+    if (
+      types.length &&
+      !types.some(
+        (type) => type === kind || (type === 'number' && kind === 'integer'),
+      )
+    )
+      return [`${path} must be ${types.join(' or ')}`];
+    const errors = [];
+    if (Array.isArray(schema.enum) && !schema.enum.includes(value))
+      errors.push(`${path} must be one of: ${schema.enum.join(', ')}`);
+    if (typeof value === 'number') {
+      if (schema.minimum != null && value < schema.minimum)
+        errors.push(`${path} must be >= ${schema.minimum}`);
+      if (schema.maximum != null && value > schema.maximum)
+        errors.push(`${path} must be <= ${schema.maximum}`);
+    }
+    if (typeof value === 'string') {
+      if (schema.minLength != null && value.length < schema.minLength)
+        errors.push(
+          `${path} must have at least ${schema.minLength} characters`,
+        );
+      if (schema.maxLength != null && value.length > schema.maxLength)
+        errors.push(`${path} must have at most ${schema.maxLength} characters`);
+    }
+    if (kind === 'array') {
+      if (schema.minItems != null && value.length < schema.minItems)
+        errors.push(`${path} needs at least ${schema.minItems} items`);
+      if (schema.maxItems != null && value.length > schema.maxItems)
+        errors.push(`${path} allows at most ${schema.maxItems} items`);
+      value.forEach((item, index) =>
+        errors.push(...schemaErrors(schema.items, item, `${path}[${index}]`)),
+      );
+    }
+    if (kind === 'object') {
+      const properties = schema.properties || {};
+      for (const key of schema.required || [])
+        if (!(key in value)) errors.push(`${path}.${key} is required`);
+      for (const [key, item] of Object.entries(value)) {
+        if (properties[key])
+          errors.push(...schemaErrors(properties[key], item, `${path}.${key}`));
+        else if (schema.additionalProperties === false)
+          errors.push(`${path}.${key} is not an allowed field`);
+      }
+    }
+    return errors;
+  }
+
+  function checkToolCall(block) {
+    if (!toolSchemas) return '';
+    const schema = toolSchemas[block.name];
+    if (!schema)
+      return `unknown tool "${block.name}". Valid tools: ${Object.keys(toolSchemas).join(', ')}`;
+    return schemaErrors(schema, block.input ?? {}, block.name)
+      .slice(0, 8)
+      .join('; ');
+  }
+
+  function startWaiting(provider) {
+    const started = Date.now();
+    const label = PROVIDER_LABELS[provider] || provider;
+    // Ollama unloads an idle model after 5 minutes, so the next local reply
+    // may first read it back into VRAM.
+    const cold =
+      provider === 'local' && Date.now() - state.lastLocalReply > 5 * 60 * 1000;
+    const render = () => {
+      const seconds = Math.floor((Date.now() - started) / 1000);
+      ui.wait.textContent = `⏳ Đang chờ ${label}… ${seconds} giây${cold ? ' (có thể đang nạp model vào VRAM)' : ''}`;
+    };
+    render();
+    const timer = win.setInterval(render, 1000);
+    return () => {
+      win.clearInterval(timer);
+      ui.wait.textContent = '';
+    };
+  }
+
   async function runTool(block, signal) {
     let args = '';
     try {
@@ -1202,7 +1300,12 @@ function claudeChatClient(win) {
     );
     let result;
     let isError = false;
-    if (typeof state.runner !== 'function') {
+    const rejected = checkToolCall(block);
+    if (rejected) {
+      // Nothing reaches the map; the model gets the reason and can retry.
+      result = { ok: false, error: `Rejected before running: ${rejected}` };
+      isError = true;
+    } else if (typeof state.runner !== 'function') {
       result = { ok: false, error: 'App tools are not available on this page' };
       isError = true;
     } else {
@@ -1213,7 +1316,11 @@ function claudeChatClient(win) {
         isError = true;
       }
     }
-    line.textContent += result?.ok === false ? ' → lỗi' : ' → xong';
+    line.textContent += rejected
+      ? ' → chặn (sai tham số)'
+      : result?.ok === false
+        ? ' → lỗi'
+        : ' → xong';
     return {
       type: 'tool_result',
       tool_use_id: block.id,
@@ -1307,11 +1414,15 @@ function claudeChatClient(win) {
       );
       let finalText = '';
       for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-        const message = await postChat(
-          state.history,
-          provider,
-          controller.signal,
-        );
+        const stopWaiting = startWaiting(provider);
+        let message;
+        try {
+          message = await postChat(state.history, provider, controller.signal);
+        } finally {
+          stopWaiting();
+        }
+        if ((message.provider || provider) === 'local')
+          state.lastLocalReply = Date.now();
         requests++;
         const used = message.usage || {};
         const turnUsage = {
