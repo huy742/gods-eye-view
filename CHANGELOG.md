@@ -21,7 +21,10 @@
   `OLLAMA_CONTEXT_LENGTH=32768`. Every tool call is checked against its
   schema before it runs; a bad call is returned to the model with the reason
   instead of reaching the map. A waiting line counts seconds while a reply is
-  pending.
+  pending. Gemini's per-minute free limit (5 requests per minute for
+  `gemini-3.8-flash` when tested) now waits out Google's retry delay and
+  resends to Gemini; only a spent daily quota (20 requests per day when
+  tested) moves free mode to AI local. Gemini "high demand" 503s are retried.
 
 - Public Overpass instances are no longer used by default. Street Traffic
   roads come from TomTom flow tiles, OpenFreeMap vector tiles, or both, chosen
