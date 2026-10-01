@@ -116,6 +116,23 @@ function metroTransitRouteMode(routeId) {
 }
 
 /**
+ * DiviaMobilités (Dijon): the two tram lines are route ids `4-T1` / `4-T2`.
+ * @param {string|null} routeId
+ * @returns {string}
+ */
+function diviaRouteMode(routeId) {
+  if (!routeId) return 'unknown';
+  if (/^4-T\d$/.test(routeId)) return 'tram';
+  return 'bus';
+}
+
+/** Licence Ouverte 2.0 reuse clause, read 2026-10-01 from the Etalab text. */
+const LICENCE_OUVERTE_2_QUOTE =
+  "Le « Réutilisateur » est libre de réutiliser l'« Information » ... de la diffuser, la redistribuer, la publier et la transmettre, de l'exploiter à titre commercial ... Sous réserve de : mentionner la paternité de l'« Information » : sa source (a minima le nom du « Concédant ») et la date de la dernière mise à jour de l'« Information » réutilisée. Le « Réutilisateur » peut notamment s'acquitter de cette condition en indiquant l'adresse (URL) renvoyant vers « l'Information »";
+const LICENCE_OUVERTE_2_NOTE =
+  "Licence named on the dataset's transport.data.gouv.fr page. The credit links that page, which is how the licence says the source and update date may be cited; the vehicles also carry the feed's own timestamp.";
+
+/**
  * Registry of feeds. Order is presentation order in the stats/credit text.
  * `loadRadiusKm` is the distance from `center` inside which the feed is polled.
  * @type {ReadonlyArray<Readonly<{
@@ -267,6 +284,131 @@ export const TRANSIT_FEED_REGISTRY = Object.freeze([
       quote:
         'Our data is licensed under a Creative Commons Attribution 4.0 International License. ... You must not represent that the State in any way endorses your Application.',
       note: 'No key, no stated rate limit, no caching rule. Logos and network imagery need separate approval, so the credit is text only.',
+    }),
+    defaultMode: 'bus',
+  }),
+  Object.freeze({
+    id: 'kcm-seattle',
+    name: 'King County Metro',
+    operator: 'King County Metro Transit',
+    region: 'Seattle, WA',
+    center: Object.freeze({ lat: 47.6062, lon: -122.3321 }),
+    loadRadiusKm: 70,
+    url: 'https://s3.amazonaws.com/kcm-alerts-realtime-prod/vehiclepositions.pb',
+    license: 'King County Transit Data Terms of Use',
+    licenseUrl:
+      'https://kingcounty.gov/en/dept/metro/rider-tools/mobile-and-web-apps',
+    attribution:
+      'Transit scheduling, geographic, and real-time data provided by permission of King County',
+    defaultEnabled: true,
+    terms: Object.freeze({
+      quote:
+        'By accessing schedule, geographic, real-time, or any other data posted by King County ("Data"), you agree to these Terms of Use ... King County grants you a limited, revocable license to use, reproduce, and redistribute the Data in accordance with these Terms. ... Should you use the Data for any purposes, you agree to provide the following legend, prominently displayed: "Transit scheduling, geographic, and real-time data provided by permission of King County"',
+      note: 'The required legend is the attribution verbatim. The terms forbid the King County logo and service marks, so the credit is text only. Read 2026-10-01 on the Metro developer page that also lists this feed URL.',
+    }),
+    defaultMode: 'bus',
+  }),
+  Object.freeze({
+    id: 'rtd-denver',
+    name: 'RTD',
+    operator: 'Regional Transportation District (RTD)',
+    region: 'Denver, CO',
+    center: Object.freeze({ lat: 39.7392, lon: -104.9903 }),
+    loadRadiusKm: 80,
+    // The www.rtd-denver.com link answers 308 to this open-data host; the
+    // proxy follows same-origin hops only, so the final URL is registered.
+    url: 'https://open-data.rtd-denver.com/files/gtfs-rt/rtd/VehiclePosition.pb',
+    license: 'RTD GTFS Realtime License Agreement',
+    licenseUrl:
+      'https://www.rtd-denver.com/open-records/open-spatial-information/gtfs-realtime-license-agreement',
+    attribution: 'Regional Transportation District (RTD), Denver',
+    defaultEnabled: true,
+    terms: Object.freeze({
+      quote:
+        'RTD hereby grants you non-exclusive, limited and revocable rights to use, reproduce, and redistribute the Data subject to the terms and conditions set forth in this Agreement. RTD trademarks and copyrighted materials, including any confusingly similar variants, may not be used in association with Data.',
+      note: 'The agreement is specific to the GTFS Realtime feeds. No trademarks, so the credit is the agency name as text; RTD may ask for an "unofficial, not endorsed" notice, which this app does not claim otherwise.',
+    }),
+    defaultMode: 'bus',
+  }),
+  Object.freeze({
+    id: 'lignes-dazur-nice',
+    name: "Lignes d'Azur",
+    operator: "Métropole Nice Côte d'Azur",
+    region: 'Nice, France',
+    center: Object.freeze({ lat: 43.7102, lon: 7.262 }),
+    loadRadiusKm: 50,
+    // The data.gouv.fr resource link redirects to this host, so the final
+    // URL is registered (the proxy follows same-origin hops only).
+    url: 'https://ara-api.enroute.mobi/rla/gtfs/vehicle-positions',
+    license: 'Licence Ouverte 2.0',
+    licenseUrl:
+      'https://transport.data.gouv.fr/datasets/donnees-statiques-et-dynamiques-du-reseau-de-transport-lignes-dazur',
+    attribution:
+      "Lignes d'Azur — Métropole Nice Côte d'Azur, via transport.data.gouv.fr (Licence Ouverte 2.0)",
+    defaultEnabled: true,
+    terms: Object.freeze({
+      quote: LICENCE_OUVERTE_2_QUOTE,
+      note: LICENCE_OUVERTE_2_NOTE,
+    }),
+    defaultMode: 'bus',
+  }),
+  Object.freeze({
+    id: 'divia-dijon',
+    name: 'Divia',
+    operator: 'DiviaMobilités (Dijon Métropole)',
+    region: 'Dijon, France',
+    center: Object.freeze({ lat: 47.322, lon: 5.0415 }),
+    loadRadiusKm: 30,
+    url: 'https://proxy.transport.data.gouv.fr/resource/divia-dijon-gtfs-rt-vehicle-position',
+    license: 'Licence Ouverte 2.0',
+    licenseUrl: 'https://transport.data.gouv.fr/datasets/gtfs-diviamobilites',
+    attribution:
+      'DiviaMobilités — Dijon Métropole, via transport.data.gouv.fr (Licence Ouverte 2.0)',
+    defaultEnabled: true,
+    terms: Object.freeze({
+      quote: LICENCE_OUVERTE_2_QUOTE,
+      note: `${LICENCE_OUVERTE_2_NOTE} Served through the national portal's own relay (proxy.transport.data.gouv.fr).`,
+    }),
+    defaultMode: 'bus',
+    routeMode: diviaRouteMode,
+  }),
+  Object.freeze({
+    id: 'lemet-metz',
+    name: "Le Met'",
+    operator: 'Eurométropole de Metz',
+    region: 'Metz, France',
+    center: Object.freeze({ lat: 49.1193, lon: 6.1757 }),
+    loadRadiusKm: 30,
+    url: 'https://proxy.transport.data.gouv.fr/resource/lemet-metz-gtfs-rt-vehicle-position',
+    license: 'Licence Ouverte 2.0',
+    licenseUrl:
+      'https://transport.data.gouv.fr/datasets/fichiers-gtfs-eurometropole-de-metz',
+    attribution:
+      "Le Met' — Eurométropole de Metz, via transport.data.gouv.fr (Licence Ouverte 2.0)",
+    defaultEnabled: true,
+    terms: Object.freeze({
+      quote: LICENCE_OUVERTE_2_QUOTE,
+      note: `${LICENCE_OUVERTE_2_NOTE} Served through the national portal's own relay (proxy.transport.data.gouv.fr).`,
+    }),
+    defaultMode: 'bus',
+  }),
+  Object.freeze({
+    id: 'bibus-brest',
+    name: 'Bibus',
+    operator: 'Brest métropole',
+    region: 'Brest, France',
+    center: Object.freeze({ lat: 48.3904, lon: -4.4861 }),
+    loadRadiusKm: 30,
+    url: 'https://proxy.transport.data.gouv.fr/resource/bibus-brest-gtfs-rt-vehicle-position',
+    license: 'Licence Ouverte 2.0',
+    licenseUrl:
+      'https://transport.data.gouv.fr/datasets/horaires-theoriques-et-temps-reel-des-bus-et-tramways-circulant-sur-le-territoire-de-brest-metropole',
+    attribution:
+      'Bibus — Brest métropole, via transport.data.gouv.fr (Licence Ouverte 2.0)',
+    defaultEnabled: true,
+    terms: Object.freeze({
+      quote: LICENCE_OUVERTE_2_QUOTE,
+      note: `${LICENCE_OUVERTE_2_NOTE} Served through the national portal's own relay (proxy.transport.data.gouv.fr).`,
     }),
     defaultMode: 'bus',
   }),

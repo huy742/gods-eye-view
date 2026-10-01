@@ -59,6 +59,28 @@ import {
   DELDOT_CCTV_URL,
   DEFAULT_DELDOT_MAX_SOURCES,
   DELDOT_ANCHORS,
+  HK_TD_CAMERAS_URL,
+  HK_TD_IMAGE_ORIGIN,
+  DEFAULT_HK_TD_MAX_SOURCES,
+  HK_TD_ANCHORS,
+  HK_TD_MAX_CATALOG_BYTES,
+  DGT_CAMERAS_URL,
+  DGT_IMAGE_ORIGIN,
+  DEFAULT_DGT_MAX_SOURCES,
+  DGT_ANCHORS,
+  DGT_MAX_CATALOG_BYTES,
+  NZTA_CAMERAS_URL,
+  NZTA_IMAGE_ORIGIN,
+  DEFAULT_NZTA_MAX_SOURCES,
+  NZTA_ANCHORS,
+  NZTA_MAX_CATALOG_BYTES,
+  HCMC_SESSION_URL,
+  HCMC_CAMERA_QUERY_URL,
+  HCMC_FRAME_URL_PREFIX,
+  HCMC_CAMERA_QUERY,
+  DEFAULT_HCMC_MAX_SOURCES,
+  HCMC_ANCHORS,
+  HCMC_MAX_CATALOG_BYTES,
 } from './constants.js';
 import {
   toFiniteNumber,
@@ -81,7 +103,10 @@ import {
   prioritizeSources,
 } from './normalize.js';
 import { directionToHeading } from '../../../src/data/directionText.js';
-import { readResponseJsonCapped } from '../common/http.js';
+import {
+  readResponseJsonCapped,
+  readCappedResponseText,
+} from '../common/http.js';
 /**
  * Fetch and parse Austin traffic camera records from the city Open Data portal.
  *
@@ -1698,6 +1723,751 @@ export async function loadDelDOTSourcesFromOpenData() {
       '[CCTV] DelDOT source download error:',
       error?.message || error,
     );
+    return [];
+  }
+}
+
+const XML_NAMED_ENTITIES = Object.freeze({
+  lt: '<',
+  gt: '>',
+  quot: '"',
+  apos: "'",
+  amp: '&',
+});
+
+/**
+ * Decode the five XML entities and numeric references in element text, in one
+ * pass so "&amp;lt;" stays the literal text "&lt;".
+ *
+ * @param {string} value
+ * @returns {string}
+ */
+export function decodeXmlText(value) {
+  return String(value ?? '').replace(
+    /&(?:#x([0-9a-f]+)|#(\d+)|(lt|gt|quot|apos|amp));/gi,
+    (match, hex, dec, name) => {
+      if (name) return XML_NAMED_ENTITIES[name.toLowerCase()];
+      const code = hex ? Number.parseInt(hex, 16) : Number.parseInt(dec, 10);
+      return Number.isInteger(code) && code > 0 && code <= 0x10ffff
+        ? String.fromCodePoint(code)
+        : '';
+    },
+  );
+}
+
+/**
+ * Text of the first `<localName>` element in `body`, whatever its namespace
+ * prefix ("loc:latitude", "latitude"), decoded and trimmed; '' when absent.
+ * DATEX II publishers choose their own prefixes, so none is assumed.
+ *
+ * @param {string} body
+ * @param {string} localName
+ * @returns {string}
+ */
+function xmlElementText(body, localName) {
+  const match = new RegExp(
+    `<(?:[A-Za-z][\\w.-]*:)?${localName}(?:\\s[^>]*)?>([^<]*)</(?:[A-Za-z][\\w.-]*:)?${localName}>`,
+  ).exec(String(body || ''));
+  return match ? decodeXmlText(match[1]).trim() : '';
+}
+
+/**
+ * Parse a frame URL and keep it only when it is an HTTPS URL under `origin`
+ * (an origin plus optional path prefix) whose path matches `pathPattern`.
+ *
+ * @param {string} raw
+ * @param {string} origin - e.g. 'https://tdcctv.data.one.gov.hk/'
+ * @param {RegExp} pathPattern - Tested against the URL pathname.
+ * @returns {?string}
+ */
+function pinnedFrameUrl(raw, origin, pathPattern) {
+  let url;
+  try {
+    url = new URL(String(raw ?? '').trim());
+  } catch {
+    return null;
+  }
+  if (
+    url.protocol !== 'https:' ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    !url.href.startsWith(origin) ||
+    !pathPattern.test(url.pathname)
+  )
+    return null;
+  return url.href;
+}
+
+/** Clamp a per-pack env cap the way the other packs do. */
+function packCap(raw, fallback, ceiling) {
+  const value = Number(raw || fallback);
+  return Number.isFinite(value)
+    ? Math.max(8, Math.min(ceiling, Math.floor(value)))
+    : fallback;
+}
+
+/**
+ * Fetch one keyless XML catalog without following redirects, reading at most
+ * `maxBytes`. Returns '' (after logging) on any failure.
+ *
+ * @param {string} url
+ * @param {number} maxBytes
+ * @param {string} label - Pack name for log lines.
+ * @returns {Promise<string>}
+ */
+async function fetchXmlCatalog(url, maxBytes, label) {
+  const resp = await fetch(url, {
+    headers: {
+      Accept: 'application/xml,text/xml',
+      'User-Agent': 'gods-eye-view-cctv-proxy/1.0',
+    },
+    redirect: 'error',
+    signal: AbortSignal.timeout(CCTV_SOURCE_FETCH_TIMEOUT_MS),
+  });
+  if (!resp.ok) {
+    try {
+      await resp.body?.cancel();
+    } catch {
+      /* no-op */
+    }
+    console.warn(`[CCTV] ${label} camera download failed:`, resp.status);
+    return '';
+  }
+  const { tooLarge, text } = await readCappedResponseText(resp, maxBytes);
+  if (tooLarge) {
+    console.warn(`[CCTV] ${label} camera catalog exceeds ${maxBytes} bytes`);
+    return '';
+  }
+  return text;
+}
+
+/**
+ * Parse the Hong Kong Transport Department camera list
+ * (Traffic_Camera_Locations_En.xml): one `<image>` per camera with key,
+ * region, district, description, latitude, longitude and the frame URL.
+ *
+ * @param {string} xml
+ * @returns {Array<{key:string, region:string, district:string, description:string, lat:number, lon:number, url:string}>}
+ */
+export function parseHkTdCameraList(xml) {
+  const out = [];
+  const blockRe = /<image>([\s\S]*?)<\/image>/g;
+  let match;
+  while ((match = blockRe.exec(String(xml || ''))) !== null) {
+    const body = match[1];
+    out.push({
+      key: xmlElementText(body, 'key'),
+      region: xmlElementText(body, 'region'),
+      district: xmlElementText(body, 'district'),
+      description: xmlElementText(body, 'description'),
+      lat: toFiniteNumber(xmlElementText(body, 'latitude')),
+      lon: toFiniteNumber(xmlElementText(body, 'longitude')),
+      url: xmlElementText(body, 'url'),
+    });
+  }
+  return out;
+}
+
+/**
+ * One Hong Kong camera entry -> one catalog source, or null.
+ *
+ * The frame URL is used as published, not rebuilt from the key: the list
+ * pairs two Cheung Pei Shan Road cameras (AID09104/AID09206) with each
+ * other's frame (seen 2026-10-01), and the publisher is the authority on
+ * which image belongs to which entry. A travel token in the description
+ * ("- Eastbound") sets the heading, as it does for DelDOT titles.
+ *
+ * @param {object} entry - From parseHkTdCameraList.
+ * @returns {?object}
+ */
+export function hkTdCameraToSource(entry) {
+  const key = String(entry?.key || '').trim();
+  if (!/^[A-Za-z0-9]{1,40}$/.test(key)) return null;
+  const { lat, lon } = entry;
+  if (
+    !isPlausibleLatLon(lat, lon) ||
+    lat < 22.1 ||
+    lat > 22.6 ||
+    lon < 113.8 ||
+    lon > 114.5
+  )
+    return null;
+  const url = pinnedFrameUrl(
+    entry.url,
+    HK_TD_IMAGE_ORIGIN,
+    /^\/[A-Za-z0-9]+\.jpe?g$/i,
+  );
+  if (!url) return null;
+  // "Aberdeen Praya Road near Fish Market [H429F]" -> drop the key suffix.
+  const name =
+    String(entry.description || '')
+      .replace(/\s*\[[^\]]*\]\s*$/, '')
+      .trim() || `Hong Kong ${key}`;
+  const heading = directionToHeading(name);
+  const hasHeading = Number.isFinite(heading);
+  const cameraId = `hk-td-${key.toLowerCase()}`;
+  return {
+    id: cameraId,
+    name,
+    city: entry.district || entry.region || 'Hong Kong',
+    cityId: 'hong-kong',
+    provider: 'Transport Department (Hong Kong)',
+    lat,
+    lon,
+    headingDeg: hasHeading ? heading : fallbackHeadingFromId(cameraId),
+    headingConfidence: hasHeading ? 'high' : 'low',
+    pitchDeg: hasHeading ? -24 : -18,
+    fovDeg: hasHeading ? 56 : 44,
+    rangeM: hasHeading ? 210 : 145,
+    mountHeightM: hasHeading ? 10 : 8,
+    groundElevationM: 10, // Estimated prior; client ground resolution owns placement.
+    feedType: 'image',
+    url,
+    snapshotUrl: url,
+    sourceKind: 'hk-td-open-data',
+    license: 'Transport Department, HKSAR Government — DATA.GOV.HK',
+    code: cameraDisplayCode(name.toUpperCase()),
+  };
+}
+
+/**
+ * Fetch Hong Kong Transport Department traffic snapshot cameras, keyless,
+ * from DATA.GOV.HK. Frames are stills on tdcctv.data.one.gov.hk.
+ *
+ * @returns {Promise<Array<object>>} Normalized camera source objects.
+ */
+export async function loadHkTdSourcesFromOpenData() {
+  try {
+    const xml = await fetchXmlCatalog(
+      HK_TD_CAMERAS_URL,
+      HK_TD_MAX_CATALOG_BYTES,
+      'Hong Kong',
+    );
+    if (!xml) return [];
+    const cameras = Array.from(
+      new Map(
+        parseHkTdCameraList(xml)
+          .map(hkTdCameraToSource)
+          .filter(Boolean)
+          .map((camera) => [camera.id, camera]),
+      ).values(),
+    );
+    const maxCount = packCap(
+      process.env.CCTV_HK_TD_MAX_SOURCES,
+      DEFAULT_HK_TD_MAX_SOURCES,
+      1100,
+    );
+    const prioritized = prioritizeSources(cameras, maxCount, HK_TD_ANCHORS);
+    console.log(
+      `[CCTV] Loaded Hong Kong camera sources: ${cameras.length} (using nearest ${prioritized.length})`,
+    );
+    return prioritized;
+  } catch (error) {
+    console.warn(
+      '[CCTV] Hong Kong camera download error:',
+      error?.message || error,
+    );
+    return [];
+  }
+}
+
+/** "CORUÑA, A" -> "Coruña, A"; "VALENCIA/VALÈNCIA" -> "Valencia/València". */
+function titleCaseWords(text) {
+  return String(text || '')
+    .toLocaleLowerCase('es')
+    .replace(
+      /(^|[\s,/(-])(\p{L})/gu,
+      (_, lead, letter) => `${lead}${letter.toLocaleUpperCase('es')}`,
+    );
+}
+
+/**
+ * Parse the DGT DATEX II v3.7 DevicePublication: one `device` per ITS
+ * device with its point location, road, kilometre point, province and frame
+ * URL. Only devices whose `typeOfDevice` is "camera" are kept.
+ *
+ * @param {string} xml
+ * @returns {Array<{id:string, road:string, destination:string, km:string, province:string, lat:number, lon:number, url:string}>}
+ */
+export function parseDgtCameraDevices(xml) {
+  const out = [];
+  const blockRe =
+    /<(?:[A-Za-z][\w.-]*:)?device\b([^>]*)>([\s\S]*?)<\/(?:[A-Za-z][\w.-]*:)?device>/g;
+  let match;
+  while ((match = blockRe.exec(String(xml || ''))) !== null) {
+    const body = match[2];
+    if (xmlElementText(body, 'typeOfDevice') !== 'camera') continue;
+    out.push({
+      id: (/\bid="([^"]*)"/.exec(match[1])?.[1] || '').trim(),
+      road: xmlElementText(body, 'roadName'),
+      destination: xmlElementText(body, 'roadDestination'),
+      km: xmlElementText(body, 'kilometerPoint'),
+      province: xmlElementText(body, 'province'),
+      lat: toFiniteNumber(xmlElementText(body, 'latitude')),
+      lon: toFiniteNumber(xmlElementText(body, 'longitude')),
+      url: xmlElementText(body, 'deviceUrl'),
+    });
+  }
+  return out;
+}
+
+/**
+ * One DGT camera device -> one catalog source, or null.
+ *
+ * NO HEADING IS DERIVED. `tpegDirection` is "unknown" for every camera, and
+ * `tpegDirectionRoad` ("positive"/"negative") is the direction of rising or
+ * falling kilometre points along the road, not a compass bearing. Headings
+ * use the id-hash fallback at low confidence, like Calgary.
+ *
+ * @param {object} device - From parseDgtCameraDevices.
+ * @returns {?object}
+ */
+export function dgtCameraToSource(device) {
+  const id = String(device?.id || '').trim();
+  if (!/^\d{1,12}$/.test(id)) return null;
+  const { lat, lon } = device;
+  // Peninsula, Balearic Islands, Ceuta and Melilla (the DGT list has no
+  // Canary Islands cameras).
+  if (
+    !isPlausibleLatLon(lat, lon) ||
+    lat < 35.0 ||
+    lat > 44.0 ||
+    lon < -9.6 ||
+    lon > 4.6
+  )
+    return null;
+  const url = pinnedFrameUrl(
+    device.url,
+    DGT_IMAGE_ORIGIN,
+    /^\/camarasEtraffic\/\d+\.jpg$/i,
+  );
+  if (!url) return null;
+  const road = String(device.road || '').trim();
+  const km = String(device.km || '').trim();
+  const place = [road, km && `km ${km}`].filter(Boolean).join(' ');
+  const destination = titleCaseWords(device.destination);
+  const name =
+    [place, destination && `(→ ${destination})`].filter(Boolean).join(' ') ||
+    `DGT ${id}`;
+  const cameraId = `es-dgt-${id}`;
+  return {
+    id: cameraId,
+    name,
+    city: titleCaseWords(device.province) || 'España',
+    cityId: 'es-dgt',
+    provider: 'DGT (Dirección General de Tráfico)',
+    lat,
+    lon,
+    headingDeg: fallbackHeadingFromId(cameraId),
+    headingConfidence: 'low',
+    pitchDeg: -18,
+    fovDeg: 44,
+    rangeM: 145,
+    mountHeightM: 8,
+    // Central-plateau prior; the client's ground snap corrects it.
+    groundElevationM: 600,
+    feedType: 'image',
+    url,
+    snapshotUrl: url,
+    sourceKind: 'dgt-datex',
+    license: 'DGT — Dirección General de Tráfico (NAP), CC BY',
+    code: cameraDisplayCode((place || `DGT ${id}`).toUpperCase()),
+  };
+}
+
+/**
+ * Fetch Spanish DGT road cameras, keyless, from the national access point
+ * (DATEX II v3.7). Frames are stills on etraffic.dgt.es.
+ *
+ * @returns {Promise<Array<object>>} Normalized camera source objects.
+ */
+export async function loadDgtSourcesFromNap() {
+  try {
+    const xml = await fetchXmlCatalog(
+      DGT_CAMERAS_URL,
+      DGT_MAX_CATALOG_BYTES,
+      'DGT',
+    );
+    if (!xml) return [];
+    const cameras = Array.from(
+      new Map(
+        parseDgtCameraDevices(xml)
+          .map(dgtCameraToSource)
+          .filter(Boolean)
+          .map((camera) => [camera.id, camera]),
+      ).values(),
+    );
+    const maxCount = packCap(
+      process.env.CCTV_DGT_MAX_SOURCES,
+      DEFAULT_DGT_MAX_SOURCES,
+      2000,
+    );
+    const prioritized = prioritizeSources(cameras, maxCount, DGT_ANCHORS);
+    console.log(
+      `[CCTV] Loaded DGT camera sources: ${cameras.length} (using nearest ${prioritized.length})`,
+    );
+    return prioritized;
+  } catch (error) {
+    console.warn('[CCTV] DGT camera download error:', error?.message || error);
+    return [];
+  }
+}
+
+/**
+ * One NZTA camera -> one catalog source, or null. Cameras the list marks
+ * `offline` or `underMaintenance` are skipped. `direction` is a dedicated
+ * field ("Southbound"), so it sets the heading.
+ *
+ * @param {object} camera - One entry of `response.camera`.
+ * @returns {?object}
+ */
+export function nztaCameraToSource(camera) {
+  if (!camera || typeof camera !== 'object') return null;
+  if (camera.offline === true || camera.underMaintenance === true) return null;
+  const rawId = String(camera.id ?? '').trim();
+  if (!/^\d{1,9}$/.test(rawId)) return null;
+  const lat = typeof camera.latitude === 'number' ? camera.latitude : NaN;
+  const lon = typeof camera.longitude === 'number' ? camera.longitude : NaN;
+  if (
+    !isPlausibleLatLon(lat, lon) ||
+    lat < -47.5 ||
+    lat > -34.0 ||
+    lon < 166.0 ||
+    lon > 178.7
+  )
+    return null;
+  let absolute;
+  try {
+    absolute = new URL(String(camera.imageUrl ?? ''), NZTA_IMAGE_ORIGIN).href;
+  } catch {
+    return null;
+  }
+  const url = pinnedFrameUrl(
+    absolute,
+    NZTA_IMAGE_ORIGIN,
+    /^\/camera\/\d+\.jpg$/i,
+  );
+  if (!url) return null;
+  const heading = directionToHeading(String(camera.direction || ''), true);
+  const hasHeading = Number.isFinite(heading);
+  const cameraId = `nzta-${rawId}`;
+  const name =
+    String(camera.name || '').trim() ||
+    String(camera.description || '').trim() ||
+    `NZTA ${rawId}`;
+  return {
+    id: cameraId,
+    name,
+    city: String(camera.region?.name || '').trim() || 'New Zealand',
+    cityId: 'nz',
+    provider: 'NZTA Waka Kotahi',
+    lat,
+    lon,
+    headingDeg: hasHeading ? heading : fallbackHeadingFromId(cameraId),
+    headingConfidence: hasHeading ? 'high' : 'low',
+    pitchDeg: hasHeading ? -24 : -18,
+    fovDeg: hasHeading ? 56 : 44,
+    rangeM: hasHeading ? 210 : 145,
+    mountHeightM: hasHeading ? 10 : 8,
+    groundElevationM: 30, // Estimated prior; client ground resolution owns placement.
+    feedType: 'image',
+    url,
+    snapshotUrl: url,
+    sourceKind: 'nzta-traffic',
+    license: 'NZTA Waka Kotahi — CC BY 4.0',
+    code: cameraDisplayCode(name.toUpperCase()),
+  };
+}
+
+/**
+ * Fetch New Zealand state-highway cameras, keyless, from the NZTA traffic
+ * REST API (v5, JSON). Frames are stills on trafficnz.info.
+ *
+ * @returns {Promise<Array<object>>} Normalized camera source objects.
+ */
+export async function loadNztaSourcesFromApi() {
+  try {
+    const resp = await fetch(NZTA_CAMERAS_URL, {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'gods-eye-view-cctv-proxy/1.0',
+      },
+      redirect: 'error',
+      signal: AbortSignal.timeout(CCTV_SOURCE_FETCH_TIMEOUT_MS),
+    });
+    if (!resp.ok) {
+      try {
+        await resp.body?.cancel();
+      } catch {
+        /* no-op */
+      }
+      console.warn('[CCTV] NZTA camera download failed:', resp.status);
+      return [];
+    }
+    const body = await readResponseJsonCapped(resp, NZTA_MAX_CATALOG_BYTES);
+    const list = body?.response?.camera;
+    // A one-camera response may come back as an object, not an array.
+    const rows = Array.isArray(list) ? list : list ? [list] : [];
+    const cameras = Array.from(
+      new Map(
+        rows
+          .map(nztaCameraToSource)
+          .filter(Boolean)
+          .map((camera) => [camera.id, camera]),
+      ).values(),
+    );
+    const maxCount = packCap(
+      process.env.CCTV_NZTA_MAX_SOURCES,
+      DEFAULT_NZTA_MAX_SOURCES,
+      600,
+    );
+    const prioritized = prioritizeSources(cameras, maxCount, NZTA_ANCHORS);
+    console.log(
+      `[CCTV] Loaded NZTA camera sources: ${cameras.length} online (using nearest ${prioritized.length})`,
+    );
+    return prioritized;
+  } catch (error) {
+    console.warn('[CCTV] NZTA camera download error:', error?.message || error);
+    return [];
+  }
+}
+
+const AJAXPRO_TABLE = 'new Ajax.Web.DataTable(';
+
+/**
+ * Turn an AjaxPro response into a value WITHOUT evaluating it. AjaxPro writes
+ * a DataTable as the JavaScript call `new Ajax.Web.DataTable(columns, rows)`;
+ * outside string literals that call becomes the array `[columns, rows]` and
+ * the rest is JSON. Any other parenthesis outside a string (another
+ * constructor, a function) is refused rather than guessed at.
+ *
+ * @param {string} text
+ * @returns {*}
+ */
+export function parseAjaxProJson(text) {
+  const source = String(text ?? '');
+  let out = '';
+  let inString = false;
+  for (let i = 0; i < source.length; i += 1) {
+    const ch = source[i];
+    if (inString) {
+      out += ch;
+      if (ch === '\\') {
+        out += source[i + 1] ?? '';
+        i += 1;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      out += ch;
+    } else if (source.startsWith(AJAXPRO_TABLE, i)) {
+      out += '[';
+      i += AJAXPRO_TABLE.length - 1;
+    } else if (ch === ')') {
+      out += ']';
+    } else if (ch === '(') {
+      throw new SyntaxError(`unexpected "(" at ${i} in AjaxPro response`);
+    } else {
+      out += ch;
+    }
+  }
+  return JSON.parse(out);
+}
+
+/** `[columns, rows]` from parseAjaxProJson -> one object per row. */
+export function ajaxProTableRows(table) {
+  if (!Array.isArray(table) || !Array.isArray(table[0])) return [];
+  const columns = table[0].map((column) => String(column?.[0] ?? ''));
+  const rows = Array.isArray(table[1]) ? table[1] : [];
+  return rows
+    .filter(Array.isArray)
+    .map((row) =>
+      Object.fromEntries(columns.map((name, index) => [name, row[index]])),
+    );
+}
+
+/**
+ * Camera rows from the portal's SearchQuery answer: `value` is
+ * [folder, [nodes, table, columns], total], and each row's `Location` is a
+ * nested table whose `Shape` is a WKT point.
+ *
+ * @param {string} text - Raw response body.
+ * @returns {Array<object>} Rows with `lat`/`lon` added where the point parses.
+ */
+export function parseHcmcCameraRows(text) {
+  const parsed = parseAjaxProJson(text);
+  if (parsed?.error) {
+    throw new Error(String(parsed.error.Message || 'AjaxPro error'));
+  }
+  return ajaxProTableRows(parsed?.value?.[1]?.[1]).map((row) => {
+    const shape = String(ajaxProTableRows(row.Location)[0]?.Shape ?? '');
+    const point =
+      /^POINT\s*\(\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)$/i.exec(
+        shape.trim(),
+      );
+    return {
+      ...row,
+      lon: point ? Number(point[1]) : NaN,
+      lat: point ? Number(point[2]) : NaN,
+    };
+  });
+}
+
+/**
+ * One portal camera row -> one catalog source, or null. Only cameras the
+ * portal reports as `UP` are kept (it marks dead feeds `NOT_IMAGE`).
+ *
+ * `Angle`, where present, becomes the heading at LOW confidence: it is a
+ * per-camera bearing in degrees on the portal's layer, but the portal does
+ * not document it, so the calibration gizmo stays the authority.
+ *
+ * @param {object} row - From parseHcmcCameraRows.
+ * @returns {?object}
+ */
+export function hcmcCameraToSource(row) {
+  if (!row || row.CamStatus !== 'UP') return null;
+  const camId = String(row.CamId ?? '').trim();
+  if (!/^[0-9a-f]{24}$/i.test(camId)) return null;
+  const { lat, lon } = row;
+  // The city after the 2025 merger, with Binh Duong and Ba Ria-Vung Tau.
+  if (
+    !isPlausibleLatLon(lat, lon) ||
+    lat < 10.2 ||
+    lat > 11.6 ||
+    lon < 106.2 ||
+    lon > 107.7
+  )
+    return null;
+  const angle =
+    row.Angle === null || row.Angle === '' ? NaN : Number(row.Angle);
+  const hasAngle = Number.isFinite(angle) && angle >= 0 && angle < 360;
+  const cameraId = `vn-hcmc-${camId.toLowerCase()}`;
+  const name =
+    String(row.DisplayName || '').trim() ||
+    String(row.Code || '').trim() ||
+    `HCMC ${camId}`;
+  const url = `${HCMC_FRAME_URL_PREFIX}${camId.toLowerCase()}`;
+  return {
+    id: cameraId,
+    name,
+    city: String(row.Disctrict || '').trim() || 'TP. Hồ Chí Minh',
+    cityId: 'vn-hcmc',
+    provider: 'Cổng thông tin giao thông TP.HCM',
+    lat,
+    lon,
+    headingDeg: hasAngle ? angle : fallbackHeadingFromId(cameraId),
+    headingConfidence: 'low',
+    pitchDeg: -18,
+    fovDeg: 44,
+    rangeM: 145,
+    mountHeightM: 8,
+    groundElevationM: 5, // Saigon river plain; the client's ground snap corrects.
+    feedType: 'image',
+    url,
+    snapshotUrl: url,
+    sourceKind: 'hcmc-portal',
+    license:
+      'Public camera on giaothong.hochiminhcity.gov.vn (Sở GTVT TP.HCM); no published reuse licence',
+    code: cameraDisplayCode(name.toUpperCase()),
+  };
+}
+
+/** `name=value` pairs from a response's Set-Cookie headers. */
+function sessionCookies(resp) {
+  const lines =
+    typeof resp.headers.getSetCookie === 'function'
+      ? resp.headers.getSetCookie()
+      : [resp.headers.get('set-cookie')].filter(Boolean);
+  return lines
+    .map((line) => String(line).split(';')[0].trim())
+    .filter((pair) => /^[^=\s]+=/.test(pair))
+    .join('; ');
+}
+
+/**
+ * Fetch the Ho Chi Minh City portal cameras. The portal answers the camera
+ * query only inside the anonymous session its map page opens, so the map
+ * page is requested first for its cookies (its body is not read), then the
+ * map's own query is sent once.
+ *
+ * @returns {Promise<Array<object>>} Normalized camera source objects.
+ */
+export async function loadHcmcSourcesFromPortal() {
+  try {
+    const page = await fetch(HCMC_SESSION_URL, {
+      headers: { 'User-Agent': 'gods-eye-view-cctv-proxy/1.0' },
+      redirect: 'manual',
+      signal: AbortSignal.timeout(CCTV_SOURCE_FETCH_TIMEOUT_MS),
+    });
+    const cookie = sessionCookies(page);
+    try {
+      await page.body?.cancel();
+    } catch {
+      /* no-op */
+    }
+    if (!page.ok || !cookie) {
+      console.warn(
+        '[CCTV] HCMC portal session failed:',
+        page.status,
+        cookie ? '' : '(no cookies)',
+      );
+      return [];
+    }
+    const resp = await fetch(HCMC_CAMERA_QUERY_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'X-AjaxPro-Method': 'SearchQuery',
+        Cookie: cookie,
+        Referer: HCMC_SESSION_URL,
+        'User-Agent': 'gods-eye-view-cctv-proxy/1.0',
+      },
+      body: JSON.stringify(HCMC_CAMERA_QUERY),
+      redirect: 'error',
+      signal: AbortSignal.timeout(CCTV_SOURCE_FETCH_TIMEOUT_MS),
+    });
+    if (!resp.ok) {
+      try {
+        await resp.body?.cancel();
+      } catch {
+        /* no-op */
+      }
+      console.warn('[CCTV] HCMC camera query failed:', resp.status);
+      return [];
+    }
+    const { tooLarge, text } = await readCappedResponseText(
+      resp,
+      HCMC_MAX_CATALOG_BYTES,
+    );
+    if (tooLarge) {
+      console.warn('[CCTV] HCMC camera list exceeds the size cap');
+      return [];
+    }
+    const cameras = Array.from(
+      new Map(
+        parseHcmcCameraRows(text)
+          .map(hcmcCameraToSource)
+          .filter(Boolean)
+          .map((camera) => [camera.id, camera]),
+      ).values(),
+    );
+    const maxCount = packCap(
+      process.env.CCTV_HCMC_MAX_SOURCES,
+      DEFAULT_HCMC_MAX_SOURCES,
+      1000,
+    );
+    const prioritized = prioritizeSources(cameras, maxCount, HCMC_ANCHORS);
+    console.log(
+      `[CCTV] Loaded HCMC camera sources: ${cameras.length} up (using nearest ${prioritized.length})`,
+    );
+    return prioritized;
+  } catch (error) {
+    console.warn('[CCTV] HCMC camera download error:', error?.message || error);
     return [];
   }
 }

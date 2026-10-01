@@ -244,6 +244,98 @@ export const DELDOT_ANCHORS = [
   { lat: 39.1582, lon: -75.5244 }, // Dover (Kent)
   { lat: 38.6906, lon: -75.3877 }, // Georgetown (Sussex)
 ];
+/** Hong Kong Transport Department traffic snapshots: one keyless XML list on
+ * DATA.GOV.HK; frames are 320x240 stills refreshed every 2 minutes. */
+export const HK_TD_CAMERAS_URL =
+  'https://static.data.gov.hk/td/traffic-snapshot-images/code/Traffic_Camera_Locations_En.xml';
+/** The only origin Hong Kong frames may come from. */
+export const HK_TD_IMAGE_ORIGIN = 'https://tdcctv.data.one.gov.hk/';
+export const DEFAULT_HK_TD_MAX_SOURCES = 200;
+export const HK_TD_ANCHORS = [
+  { lat: 22.2819, lon: 114.1582 }, // Central
+  { lat: 22.3193, lon: 114.1694 }, // Mong Kok
+  { lat: 22.3817, lon: 114.1886 }, // Sha Tin
+];
+/** The whole territory is ~1,000 cameras in ~400 KB. */
+export const HK_TD_MAX_CATALOG_BYTES = 4 * 1024 * 1024;
+
+/** DGT (Spain): keyless national DATEX II v3.7 camera list on the NAP;
+ * covers state roads except the Basque Country and Catalonia. */
+export const DGT_CAMERAS_URL =
+  'https://nap.dgt.es/datex2/v3/dgt/DevicePublication/camaras_datex2_v37.xml';
+/** The only path DGT frames may come from. */
+export const DGT_IMAGE_ORIGIN = 'https://etraffic.dgt.es/camarasEtraffic/';
+export const DEFAULT_DGT_MAX_SOURCES = 250;
+export const DGT_ANCHORS = [
+  { lat: 40.4168, lon: -3.7038 }, // Madrid
+  { lat: 39.4699, lon: -0.3763 }, // Valencia
+  { lat: 37.3891, lon: -5.9845 }, // Sevilla
+  { lat: 41.6488, lon: -0.8891 }, // Zaragoza
+  { lat: 36.7213, lon: -4.4214 }, // Málaga
+];
+/** ~1,950 cameras in ~3.7 MB (measured 2026-10-01). */
+export const DGT_MAX_CATALOG_BYTES = 16 * 1024 * 1024;
+
+/** NZTA Waka Kotahi (New Zealand): keyless traffic REST v5 camera list,
+ * read as JSON; frames are stills on trafficnz.info. */
+export const NZTA_CAMERAS_URL =
+  'https://trafficnz.info/service/traffic/rest/5/cameras/all';
+/** Base for the list's relative `imageUrl` ("/camera/714.jpg") and the only
+ * path NZTA frames may come from. */
+export const NZTA_IMAGE_ORIGIN = 'https://trafficnz.info/camera/';
+export const DEFAULT_NZTA_MAX_SOURCES = 300;
+export const NZTA_ANCHORS = [
+  { lat: -36.8485, lon: 174.7633 }, // Auckland
+  { lat: -41.2865, lon: 174.7762 }, // Wellington
+  { lat: -43.5321, lon: 172.6362 }, // Christchurch
+];
+/** ~310 cameras in ~240 KB of JSON (measured 2026-10-01). */
+export const NZTA_MAX_CATALOG_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Ho Chi Minh City traffic portal (Sở GTVT TP.HCM): the cameras on the
+ * portal's public map. The portal publishes no API and no reuse terms (its
+ * "Điều khoản" link is empty, checked 2026-10-01); the list is the query the
+ * map itself sends, under the anonymous session the map page hands every
+ * visitor. Frames come from the portal's own image handler.
+ */
+export const HCMC_PORTAL_ORIGIN = 'https://giaothong.hochiminhcity.gov.vn';
+export const HCMC_SESSION_URL = `${HCMC_PORTAL_ORIGIN}/Map.aspx`;
+export const HCMC_CAMERA_QUERY_URL = `${HCMC_PORTAL_ORIGIN}/ajaxpro/VDMS.Web.Library.AJAX.FolderAjax,VDMS.Web.Library.ashx`;
+/** Frame URL prefix; the 24-hex camera id follows. */
+export const HCMC_FRAME_URL_PREFIX = `${HCMC_PORTAL_ORIGIN}/render/ImageHandler.ashx?id=`;
+/** The map's own camera query (public/global.js getCamData), with the
+ * Location column added so each camera carries its point. */
+export const HCMC_CAMERA_QUERY = Object.freeze({
+  path: '/root/vdms/tangthu/data/layerdata/camera',
+  isInTree: false,
+  searchKey: '',
+  layer: ['CAMERA'],
+  detail: true,
+  page: 0,
+  limit: -1,
+  filterQuery: ['Publish:true'],
+  sortby: null,
+  returnFields: [
+    'CamId',
+    'Code',
+    'Location',
+    'CamType',
+    'Disctrict',
+    'CamStatus',
+    'Angle',
+    'DisplayName',
+  ],
+});
+export const DEFAULT_HCMC_MAX_SOURCES = 700;
+export const HCMC_ANCHORS = [
+  { lat: 10.7725, lon: 106.698 }, // Bến Thành
+  { lat: 10.7546, lon: 106.6634 }, // Chợ Lớn
+  { lat: 10.8494, lon: 106.7717 }, // Thủ Đức
+];
+/** ~800 cameras in ~2.5 MB (measured 2026-10-01). */
+export const HCMC_MAX_CATALOG_BYTES = 16 * 1024 * 1024;
+
 /** Camera CATALOGS change rarely; 15 min keeps multi-megabyte upstream list refetches (Austin rows.json + 4 Caltrans districts + TfL + Ontario 511) infrequent. Frames are fetched per-request and are unaffected. */
 export const CCTV_SOURCE_CACHE_MS = 15 * 60 * 1000;
 /** Per-provider catalog-fetch timeout. Bounds the worst-case refresh so one

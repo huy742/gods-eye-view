@@ -1,5 +1,14 @@
 # Changelog
 
+- CCTV adds Hong Kong (Transport Department, DATA.GOV.HK), Spain (DGT DATEX II
+  camera list on the national access point), New Zealand (NZTA traffic API)
+  and Ho Chi Minh City (the public map of giaothong.hochiminhcity.gov.vn)
+  camera packs, each with `CCTV_<PACK>_ENABLED` / `CCTV_<PACK>_MAX_SOURCES`.
+  Frame URLs are pinned to each publisher's host; the HCMC portal's AjaxPro
+  answer is parsed without evaluating it. Transit adds King County Metro
+  (Seattle), RTD (Denver), Lignes d'Azur (Nice), Divia (Dijon), Le Met' (Metz)
+  and Bibus (Brest), with each operator's terms quoted in the registry.
+
 - Claude chat panel (bottom-left "Claude" button): type or speak to Claude,
   which drives the map through the same 30 tools as the OpenAI voice agent.
   `server/providers/claude-chat.js` proxies `/api/claude/chat` to the Anthropic
