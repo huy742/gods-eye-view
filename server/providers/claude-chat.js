@@ -621,7 +621,9 @@ function createClaudeChatHandler({
       if (abort.signal.aborted) return;
       const [status, body] = providerError(provider, error);
       if (status >= 500)
-        console.warn(`[claude-chat] ${provider} request failed`);
+        console.warn(
+          `[claude-chat] ${provider} request failed: ${body.detail || body.error}`,
+        );
       sendJson(res, status, body);
     }
   };
@@ -697,7 +699,15 @@ function createClaudeChatHandler({
           ];
         return [error.status, { error: message }];
       }
-      return [502, { error: 'Could not reach the Gemini API' }];
+      const detail = networkCause(error);
+      return [
+        502,
+        {
+          error: `Could not reach the Gemini API (${detail})`,
+          type: 'network_error',
+          detail,
+        },
+      ];
     }
     if (error instanceof Anthropic.APIError && error.status) {
       return [
@@ -721,8 +731,34 @@ function createClaudeChatHandler({
         },
       ];
     }
-    return [502, { error: 'Could not reach the Anthropic API' }];
+    const detail = networkCause(error);
+    return [
+      502,
+      {
+        error: `Could not reach the Anthropic API (${detail})`,
+        type: 'network_error',
+        detail,
+      },
+    ];
   }
+}
+
+/**
+ * The low-level reason a request never got an HTTP answer: a Node error code
+ * such as ENOTFOUND, ECONNRESET or UNABLE_TO_GET_ISSUER_CERT_LOCALLY when
+ * there is one. Shown in the panel and the server log so a blocked network,
+ * DNS or certificate problem can be told apart.
+ */
+function networkCause(error) {
+  let cause = error;
+  for (let depth = 0; depth < 4 && cause; depth++) {
+    if (cause.code && typeof cause.code === 'string') return cause.code;
+    cause = cause.cause;
+  }
+  return String(error?.cause?.message || error?.message || 'unknown').slice(
+    0,
+    120,
+  );
 }
 
 /** Share the runner built in gevRealtime.js with the chat panel. */

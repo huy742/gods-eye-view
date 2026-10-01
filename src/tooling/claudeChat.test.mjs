@@ -3,6 +3,7 @@ import { once } from 'node:events';
 import { readFileSync } from 'node:fs';
 import http from 'node:http';
 import test from 'node:test';
+import Anthropic from '@anthropic-ai/sdk';
 
 import {
   ASSISTANT_SYSTEM_PROMPT,
@@ -1078,5 +1079,37 @@ test('effort picked in the panel reaches each provider', async () => {
   } finally {
     await proxy.close();
     await gemini.close();
+  }
+});
+
+test('an unreachable API names the network error code', async () => {
+  const closed = await closedPortURL();
+  const proxy = await startProxy({
+    env: { ANTHROPIC_API_KEY: 'k', GEMINI_API_KEY: 'g' },
+    baseURL: closed,
+    geminiBaseURL: closed,
+    createClient: (options) => new Anthropic({ ...options, maxRetries: 0 }),
+    geminiRetryOptions: { attempts: 1 },
+  });
+  try {
+    let response = await proxy.post({
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.equal(response.status, 502);
+    assert.deepEqual(await response.json(), {
+      error: 'Could not reach the Anthropic API (ECONNREFUSED)',
+      type: 'network_error',
+      detail: 'ECONNREFUSED',
+    });
+    response = await proxy.post({
+      provider: 'gemini',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.equal(response.status, 502);
+    const gemini = await response.json();
+    assert.equal(gemini.detail, 'ECONNREFUSED');
+    assert.equal(gemini.error, 'Could not reach the Gemini API (ECONNREFUSED)');
+  } finally {
+    await proxy.close();
   }
 });
