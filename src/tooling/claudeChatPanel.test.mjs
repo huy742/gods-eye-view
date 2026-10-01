@@ -850,3 +850,104 @@ test('the popup says when free mode is running on AI local', async () => {
   pickMode(chat, 'free');
   assert.equal(chat.ui.spent.hidden, true);
 });
+
+test("free mode waits out Gemini's per-minute limit instead of leaving it", async () => {
+  const { chat, chatBodies } = setup({
+    replies: [
+      {
+        httpStatus: 429,
+        body: {
+          error: 'You exceeded your current quota',
+          type: 'quota_exhausted',
+          scope: 'minute',
+          retryAfter: 0.2,
+          limit: 5,
+        },
+      },
+      {
+        ...textReply('Đã tới Paris.'),
+        model: 'gemini-3.8-flash',
+        provider: 'gemini',
+      },
+    ],
+  });
+  chat.shareRunner(async () => ({ ok: true }));
+  pickMode(chat, 'free');
+  const sending = chat.send('bay tới Paris');
+  await settle(
+    () => /chỉ cho 5 lượt\/phút/.test(chat.ui.wait.textContent),
+    'countdown',
+  );
+  assert.match(
+    chat.ui.wait.textContent,
+    /^⏳ Gemini gói miễn phí chỉ cho 5 lượt\/phút; tự gửi lại sau \d+ giây…$/,
+  );
+  assert.equal(await sending, true);
+  assert.deepEqual(
+    chatBodies.map((body) => body.provider),
+    ['gemini', 'gemini'],
+  );
+  assert.equal(chat.state.geminiSpent, false);
+  assert.equal(chat.state.history.length, 2);
+  const lines = [...chat.ui.log.children].map((line) => line.textContent);
+  assert.equal(lines.at(-1), 'Đã tới Paris.');
+});
+
+test('a spent daily Gemini quota moves free mode to AI local', async () => {
+  const { chat, chatBodies } = setup({
+    replies: [
+      {
+        httpStatus: 429,
+        body: {
+          error: 'Quota',
+          type: 'quota_exhausted',
+          scope: 'day',
+          retryAfter: 3600,
+        },
+      },
+      { ...textReply('local'), model: 'qwen3:14b', provider: 'local' },
+    ],
+  });
+  chat.shareRunner(async () => ({ ok: true }));
+  pickMode(chat, 'free');
+  await chat.send('chào');
+  assert.deepEqual(
+    chatBodies.map((body) => body.provider),
+    ['gemini', 'local'],
+  );
+  const lines = [...chat.ui.log.children].map((line) => line.textContent);
+  assert.ok(
+    lines.some((line) =>
+      line.startsWith('Gemini báo đã hết lượt miễn phí trong ngày.'),
+    ),
+  );
+});
+
+test('Stop cancels the per-minute wait', async () => {
+  const { chat, chatBodies } = setup({
+    replies: [
+      {
+        httpStatus: 429,
+        body: {
+          error: 'Quota',
+          type: 'quota_exhausted',
+          scope: 'minute',
+          retryAfter: 30,
+        },
+      },
+    ],
+  });
+  chat.shareRunner(async () => ({ ok: true }));
+  pickMode(chat, 'free');
+  const sending = chat.send('chào');
+  await settle(
+    () => /tự gửi lại sau/.test(chat.ui.wait.textContent),
+    'countdown',
+  );
+  chat.ui.send.click();
+  assert.equal(await sending, false);
+  assert.equal(chatBodies.length, 1);
+  assert.equal(chat.ui.wait.textContent, '');
+  const lines = [...chat.ui.log.children].map((line) => line.textContent);
+  assert.match(lines.at(-1), /^Đã dừng\./);
+});

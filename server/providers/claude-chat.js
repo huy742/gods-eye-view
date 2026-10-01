@@ -373,18 +373,44 @@ function fromGeminiResponse(response, requestedModel) {
 }
 
 /** Gemini errors carry the upstream JSON after a status prefix. */
-function geminiErrorMessage(error) {
+function geminiErrorBody(error) {
   const text = String(error?.message || error);
   const start = text.indexOf('{');
   if (start >= 0) {
     try {
       const parsed = JSON.parse(text.slice(start));
-      if (parsed?.error?.message) return parsed.error.message;
+      if (parsed?.error) return parsed.error;
     } catch {
       // Fall back to the raw message.
     }
   }
-  return text;
+  return { message: text };
+}
+
+/**
+ * Which free-tier quota a Gemini 429 hit. Google names it in a QuotaFailure
+ * (for example GenerateRequestsPerMinutePerProjectPerModel-FreeTier, limit 5)
+ * and says when to retry in a RetryInfo ("31s").
+ */
+function geminiQuota(body) {
+  const details = Array.isArray(body?.details) ? body.details : [];
+  const violations = details.flatMap((detail) =>
+    Array.isArray(detail?.violations) ? detail.violations : [],
+  );
+  const ids = violations.map((violation) => String(violation?.quotaId || ''));
+  const scope = ids.some((id) => id.includes('PerDay'))
+    ? 'day'
+    : ids.some((id) => id.includes('PerMinute'))
+      ? 'minute'
+      : 'unknown';
+  const delay = details.find((detail) => detail?.retryDelay)?.retryDelay;
+  const retryAfter = Number.parseFloat(String(delay || ''));
+  const limit = Number.parseInt(violations[0]?.quotaValue, 10);
+  return {
+    scope,
+    ...(Number.isFinite(retryAfter) ? { retryAfter } : {}),
+    ...(Number.isFinite(limit) ? { limit } : {}),
+  };
 }
 
 async function probeOllama({ baseURL, model }, fetchImpl) {
@@ -512,10 +538,20 @@ function createClaudeStatusHandler({
   };
 }
 
+// Google's free tier often answers 503 "high demand" for a moment; retry
+// those, but never a 429, which the panel handles itself.
+const GEMINI_RETRY_OPTIONS = {
+  attempts: 3,
+  initialDelay: 1,
+  maxDelay: 4,
+  httpStatusCodes: [500, 502, 503, 504],
+};
+
 function createClaudeChatHandler({
   env = process.env,
   baseURL,
   geminiBaseURL,
+  geminiRetryOptions = GEMINI_RETRY_OPTIONS,
   createClient = (options) => new Anthropic(options),
   createGeminiClient = (options) => new GoogleGenAI(options),
 } = {}) {
@@ -585,7 +621,9 @@ function createClaudeChatHandler({
       if (abort.signal.aborted) return;
       const [status, body] = providerError(provider, error);
       if (status >= 500)
-        console.warn(`[claude-chat] ${provider} request failed`);
+        console.warn(
+          `[claude-chat] ${provider} request failed: ${body.detail || body.error}`,
+        );
       sendJson(res, status, body);
     }
   };
@@ -633,7 +671,10 @@ function createClaudeChatHandler({
     const client = cachedClient(`gemini:${apiKey}`, () =>
       createGeminiClient({
         apiKey,
-        ...(geminiBaseURL ? { httpOptions: { baseUrl: geminiBaseURL } } : {}),
+        httpOptions: {
+          ...(geminiBaseURL ? { baseUrl: geminiBaseURL } : {}),
+          retryOptions: geminiRetryOptions,
+        },
       }),
     );
     return async (signal) =>
@@ -649,13 +690,24 @@ function createClaudeChatHandler({
   function providerError(provider, error) {
     if (provider === 'gemini') {
       if (error instanceof GeminiApiError && error.status) {
-        const message = geminiErrorMessage(error);
-        // Free-tier quota (per minute or per day) is spent.
+        const body = geminiErrorBody(error);
+        const message = String(body.message || error.message).split('\n')[0];
         if (error.status === 429)
-          return [429, { error: message, type: 'quota_exhausted' }];
+          return [
+            429,
+            { error: message, type: 'quota_exhausted', ...geminiQuota(body) },
+          ];
         return [error.status, { error: message }];
       }
-      return [502, { error: 'Could not reach the Gemini API' }];
+      const detail = networkCause(error);
+      return [
+        502,
+        {
+          error: `Could not reach the Gemini API (${detail})`,
+          type: 'network_error',
+          detail,
+        },
+      ];
     }
     if (error instanceof Anthropic.APIError && error.status) {
       return [
@@ -679,8 +731,34 @@ function createClaudeChatHandler({
         },
       ];
     }
-    return [502, { error: 'Could not reach the Anthropic API' }];
+    const detail = networkCause(error);
+    return [
+      502,
+      {
+        error: `Could not reach the Anthropic API (${detail})`,
+        type: 'network_error',
+        detail,
+      },
+    ];
   }
+}
+
+/**
+ * The low-level reason a request never got an HTTP answer: a Node error code
+ * such as ENOTFOUND, ECONNRESET or UNABLE_TO_GET_ISSUER_CERT_LOCALLY when
+ * there is one. Shown in the panel and the server log so a blocked network,
+ * DNS or certificate problem can be told apart.
+ */
+function networkCause(error) {
+  let cause = error;
+  for (let depth = 0; depth < 4 && cause; depth++) {
+    if (cause.code && typeof cause.code === 'string') return cause.code;
+    cause = cause.cause;
+  }
+  return String(error?.cause?.message || error?.message || 'unknown').slice(
+    0,
+    120,
+  );
 }
 
 /** Share the runner built in gevRealtime.js with the chat panel. */
@@ -1407,7 +1485,13 @@ function claudeChatClient(win, { toolSchemas = null } = {}) {
             ? `${data.error} (HTTP ${response.status})`
             : `HTTP ${response.status}`,
         ),
-        { status: response.status, type: data?.type },
+        {
+          status: response.status,
+          type: data?.type,
+          scope: data?.scope,
+          retryAfter: data?.retryAfter,
+          limit: data?.limit,
+        },
       );
     if (!data || !Array.isArray(data.content))
       throw new Error('Phản hồi không hợp lệ từ /api/claude/chat');
@@ -1579,6 +1663,65 @@ function claudeChatClient(win, { toolSchemas = null } = {}) {
     ui.usage.textContent = parts.join(' · ');
   }
 
+  // Gemini's free tier also limits calls per minute (5 for gemini-3.8-flash
+  // when tested). That window reopens in seconds, so wait for it instead of
+  // leaving Gemini; only a spent daily quota moves free mode to AI local.
+  const MINUTE_QUOTA_WAITS = 2;
+  const MINUTE_QUOTA_MAX_SECONDS = 90;
+
+  async function requestReply(provider, effort, signal) {
+    for (let attempt = 0; ; attempt++) {
+      const stopWaiting = startWaiting(provider);
+      try {
+        return await postChat(state.history, provider, effort, signal);
+      } catch (error) {
+        const seconds = Number(error?.retryAfter);
+        if (
+          provider !== 'gemini' ||
+          error?.type !== 'quota_exhausted' ||
+          error?.scope !== 'minute' ||
+          !(seconds > 0) ||
+          seconds > MINUTE_QUOTA_MAX_SECONDS ||
+          attempt >= MINUTE_QUOTA_WAITS
+        )
+          throw error;
+        stopWaiting();
+        await waitForMinuteQuota(seconds, error.limit, signal);
+      } finally {
+        stopWaiting();
+      }
+    }
+  }
+
+  function waitForMinuteQuota(seconds, limit, signal) {
+    const until = Date.now() + Math.ceil(seconds * 1000) + 500;
+    const per = limit ? `${limit} lượt/phút` : 'số lượt mỗi phút';
+    return new Promise((resolve, reject) => {
+      const render = () => {
+        const left = Math.max(0, Math.ceil((until - Date.now()) / 1000));
+        ui.wait.textContent = `⏳ Gemini gói miễn phí chỉ cho ${per}; tự gửi lại sau ${left} giây…`;
+      };
+      const finish = () => {
+        win.clearInterval(timer);
+        win.clearTimeout(timeout);
+        signal?.removeEventListener?.('abort', abort);
+        ui.wait.textContent = '';
+      };
+      const abort = () => {
+        finish();
+        reject(Object.assign(new Error('Aborted'), { name: 'AbortError' }));
+      };
+      render();
+      const timer = win.setInterval(render, 1000);
+      const timeout = win.setTimeout(() => {
+        finish();
+        resolve();
+      }, until - Date.now());
+      if (signal?.aborted) abort();
+      else signal?.addEventListener?.('abort', abort, { once: true });
+    });
+  }
+
   async function send(rawText, { voice = false } = {}) {
     const text = String(rawText == null ? '' : rawText).trim();
     if (!text || state.busy || !mount()) return false;
@@ -1643,18 +1786,7 @@ function claudeChatClient(win, { toolSchemas = null } = {}) {
       );
       let finalText = '';
       for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-        const stopWaiting = startWaiting(provider);
-        let message;
-        try {
-          message = await postChat(
-            state.history,
-            provider,
-            effort,
-            controller.signal,
-          );
-        } finally {
-          stopWaiting();
-        }
+        const message = await requestReply(provider, effort, controller.signal);
         if ((message.provider || provider) === 'local')
           state.lastLocalReply = Date.now();
         requests++;
@@ -1726,9 +1858,15 @@ function claudeChatClient(win, { toolSchemas = null } = {}) {
       ) {
         state.geminiSpent = true;
         retryOnLocal = true;
+        const why =
+          error.scope === 'day'
+            ? 'Gemini báo đã hết lượt miễn phí trong ngày.'
+            : error.scope === 'minute'
+              ? 'Gemini vẫn chạm giới hạn mỗi phút sau khi đã chờ.'
+              : 'Gemini báo hết lượt miễn phí.';
         addLine(
           'system',
-          'Gemini báo hết lượt miễn phí. Đã chuyển sang AI local và gửi lại tin này. Chọn lại "Miễn phí" để thử Gemini lần nữa.',
+          `${why} Đã chuyển sang AI local và gửi lại tin này. Chọn lại "Miễn phí" để thử Gemini lần nữa.`,
         );
       } else {
         addLine(
@@ -1979,6 +2117,7 @@ export {
   createClaudeChatHandler,
   createClaudeStatusHandler,
   fromGeminiResponse,
+  geminiQuota,
   patchGevRealtime,
   prepareClaudeMessages,
   resolveClaudeConfig,

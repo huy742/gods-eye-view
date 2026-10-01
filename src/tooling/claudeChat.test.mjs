@@ -3,6 +3,7 @@ import { once } from 'node:events';
 import { readFileSync } from 'node:fs';
 import http from 'node:http';
 import test from 'node:test';
+import Anthropic from '@anthropic-ai/sdk';
 
 import {
   ASSISTANT_SYSTEM_PROMPT,
@@ -781,32 +782,131 @@ test('Gemini round trip returns thought signatures and function results', async 
   }
 });
 
-test('a spent Gemini quota answers 429 quota_exhausted at once', async () => {
-  const gemini = await startFakeGemini(() => ({
-    status: 429,
-    body: {
-      error: {
-        code: 429,
-        message: 'You exceeded your current quota.',
-        status: 'RESOURCE_EXHAUSTED',
-      },
+// The 429 body Gemini's free tier returned in a live test (2026-10-01).
+function geminiQuotaBody(quotaId, quotaValue, retryDelay) {
+  return {
+    error: {
+      code: 429,
+      message:
+        'You exceeded your current quota, please check your plan and billing details.\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests',
+      status: 'RESOURCE_EXHAUSTED',
+      details: [
+        {
+          '@type': 'type.googleapis.com/google.rpc.Help',
+          links: [{ description: 'Learn more', url: 'https://ai.google.dev' }],
+        },
+        {
+          '@type': 'type.googleapis.com/google.rpc.QuotaFailure',
+          violations: [
+            {
+              quotaMetric:
+                'generativelanguage.googleapis.com/generate_content_free_tier_requests',
+              quotaId,
+              quotaDimensions: {
+                location: 'global',
+                model: 'gemini-3.8-flash',
+              },
+              quotaValue,
+            },
+          ],
+        },
+        {
+          '@type': 'type.googleapis.com/google.rpc.RetryInfo',
+          retryDelay,
+        },
+      ],
     },
-  }));
+  };
+}
+
+test('a Gemini 429 says which free quota ran out, with no retries', async () => {
+  let body = geminiQuotaBody(
+    'GenerateRequestsPerMinutePerProjectPerModel-FreeTier',
+    '5',
+    '31s',
+  );
+  const gemini = await startFakeGemini(() => ({ status: 429, body }));
   const proxy = await startProxy({
     env: { GEMINI_API_KEY: 'g-key' },
     geminiBaseURL: gemini.baseURL,
+  });
+  const ask = () =>
+    proxy.post({
+      provider: 'gemini',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+  try {
+    let response = await ask();
+    assert.equal(response.status, 429);
+    assert.deepEqual(await response.json(), {
+      error:
+        'You exceeded your current quota, please check your plan and billing details.',
+      type: 'quota_exhausted',
+      scope: 'minute',
+      retryAfter: 31,
+      limit: 5,
+    });
+    assert.equal(gemini.requests.length, 1, 'no retries');
+
+    body = geminiQuotaBody(
+      'GenerateRequestsPerDayPerProjectPerModel-FreeTier',
+      '250',
+      '3600s',
+    );
+    response = await ask();
+    const day = await response.json();
+    assert.equal(day.scope, 'day');
+    assert.equal(day.limit, 250);
+
+    body = {
+      error: { code: 429, message: 'Quota', status: 'RESOURCE_EXHAUSTED' },
+    };
+    response = await ask();
+    assert.deepEqual(await response.json(), {
+      error: 'Quota',
+      type: 'quota_exhausted',
+      scope: 'unknown',
+    });
+    assert.equal(gemini.requests.length, 3);
+  } finally {
+    await proxy.close();
+    await gemini.close();
+  }
+});
+
+test('a Gemini 503 "high demand" is retried before giving up', async () => {
+  const gemini = await startFakeGemini((_, count) =>
+    count < 3
+      ? {
+          status: 503,
+          body: {
+            error: {
+              code: 503,
+              message: 'This model is currently experiencing high demand.',
+              status: 'UNAVAILABLE',
+            },
+          },
+        }
+      : { body: GEMINI_TOOL_CALL },
+  );
+  const proxy = await startProxy({
+    env: { GEMINI_API_KEY: 'g-key' },
+    geminiBaseURL: gemini.baseURL,
+    geminiRetryOptions: {
+      attempts: 3,
+      initialDelay: 0.01,
+      maxDelay: 0.02,
+      jitter: 0,
+      httpStatusCodes: [503],
+    },
   });
   try {
     const response = await proxy.post({
       provider: 'gemini',
       messages: [{ role: 'user', content: 'hi' }],
     });
-    assert.equal(response.status, 429);
-    assert.deepEqual(await response.json(), {
-      error: 'You exceeded your current quota.',
-      type: 'quota_exhausted',
-    });
-    assert.equal(gemini.requests.length, 1, 'no retries');
+    assert.equal(response.status, 200);
+    assert.equal(gemini.requests.length, 3);
   } finally {
     await proxy.close();
     await gemini.close();
@@ -979,5 +1079,37 @@ test('effort picked in the panel reaches each provider', async () => {
   } finally {
     await proxy.close();
     await gemini.close();
+  }
+});
+
+test('an unreachable API names the network error code', async () => {
+  const closed = await closedPortURL();
+  const proxy = await startProxy({
+    env: { ANTHROPIC_API_KEY: 'k', GEMINI_API_KEY: 'g' },
+    baseURL: closed,
+    geminiBaseURL: closed,
+    createClient: (options) => new Anthropic({ ...options, maxRetries: 0 }),
+    geminiRetryOptions: { attempts: 1 },
+  });
+  try {
+    let response = await proxy.post({
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.equal(response.status, 502);
+    assert.deepEqual(await response.json(), {
+      error: 'Could not reach the Anthropic API (ECONNREFUSED)',
+      type: 'network_error',
+      detail: 'ECONNREFUSED',
+    });
+    response = await proxy.post({
+      provider: 'gemini',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.equal(response.status, 502);
+    const gemini = await response.json();
+    assert.equal(gemini.detail, 'ECONNREFUSED');
+    assert.equal(gemini.error, 'Could not reach the Gemini API (ECONNREFUSED)');
+  } finally {
+    await proxy.close();
   }
 });
