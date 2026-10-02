@@ -18,6 +18,10 @@ import {
   loadNswSourcesFromOpenData,
   loadCalgarySourcesFromOpenData,
   loadDelDOTSourcesFromOpenData,
+  loadHkTdSourcesFromOpenData,
+  loadDgtSourcesFromNap,
+  loadNztaSourcesFromApi,
+  loadHcmcSourcesFromPortal,
 } from './sources.js';
 
 /** Env kill switch: unset or anything but "0" means enabled. */
@@ -91,6 +95,26 @@ const LIVE_PACKS = [
     name: 'deldot',
     enabled: () => envEnabled('CCTV_DELDOT_ENABLED'),
     load: loadDelDOTSourcesFromOpenData,
+  },
+  {
+    name: 'hk-td',
+    enabled: () => envEnabled('CCTV_HK_TD_ENABLED'),
+    load: loadHkTdSourcesFromOpenData,
+  },
+  {
+    name: 'dgt',
+    enabled: () => envEnabled('CCTV_DGT_ENABLED'),
+    load: loadDgtSourcesFromNap,
+  },
+  {
+    name: 'nzta',
+    enabled: () => envEnabled('CCTV_NZTA_ENABLED'),
+    load: loadNztaSourcesFromApi,
+  },
+  {
+    name: 'hcmc',
+    enabled: () => envEnabled('CCTV_HCMC_ENABLED'),
+    load: loadHcmcSourcesFromPortal,
   },
 ];
 /**

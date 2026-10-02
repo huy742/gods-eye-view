@@ -241,6 +241,31 @@ export const DATA_CREDITS = [
       '<a href="https://data.calgary.ca/stories/s/Open-Calgary-Terms-of-Use/u45n-7awa" target="_blank" rel="noopener">Open Government Licence – City of Calgary</a>',
   },
   {
+    key: 'hk-td-cctv',
+    html:
+      'Traffic cameras (Hong Kong): Transport Department, HKSAR Government — ' +
+      '<a href="https://data.gov.hk/en-data/dataset/hk-td-tis_2-traffic-snapshot-images" target="_blank" rel="noopener">DATA.GOV.HK</a> ' +
+      '(<a href="https://data.gov.hk/en/terms-and-conditions" target="_blank" rel="noopener">terms</a>)',
+  },
+  {
+    key: 'dgt-cctv',
+    html:
+      'Traffic cameras (Spain): DGT — Dirección General de Tráfico, ' +
+      '<a href="https://nap.dgt.es/en/dataset/camaras-dgt-datex2-v3-7" target="_blank" rel="noopener">Punto de Acceso Nacional</a> (CC BY)',
+  },
+  {
+    key: 'nzta-cctv',
+    html:
+      'Traffic cameras (New Zealand): ' +
+      '<a href="https://www.nzta.govt.nz/traffic-and-travel-information/use-our-data/" target="_blank" rel="noopener">NZTA Waka Kotahi</a>, CC BY 4.0',
+  },
+  {
+    key: 'hcmc-cctv',
+    html:
+      'Traffic cameras (Ho Chi Minh City): ' +
+      '<a href="https://giaothong.hochiminhcity.gov.vn/" target="_blank" rel="noopener">Cổng thông tin giao thông TP.HCM</a> (courtesy)',
+  },
+  {
     key: 'gbfs',
     html: 'Bikeshare availability: GBFS operator feeds (e.g. Austin BCycle)',
   },

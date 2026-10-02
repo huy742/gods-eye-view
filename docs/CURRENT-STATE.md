@@ -2951,8 +2951,9 @@ Transit is off by default, and share links use token `j`. The movement panel ord
 places Transit directly after Street Traffic and before Bike Share. Cameras and
 utilities retain their own groups. The layer polls
 registered feeds near the camera every 15 seconds, below a 3,000 km altitude
-gate. Seven keyless regions are available: Boston, Austin, Minneapolis–St Paul,
-Helsinki, the Netherlands, Norway and South East Queensland. Mode silhouettes
+gate. Thirteen keyless regions are available: Boston, Austin, Minneapolis–St Paul,
+Seattle, Denver, Helsinki, the Netherlands, Norway, South East Queensland, Nice,
+Dijon, Metz and Brest. Mode silhouettes
 identify buses, trams, subways, trains, ferries and unclassified vehicles.
 
 Retained transit history uses the same outlier quarantine as live observations and
@@ -3871,6 +3872,49 @@ The `Chat AI` button (bottom-left) opens a chat panel, registered by `claudeChat
 - **Waiting line**: while a reply is pending the panel shows `⏳ Đang chờ <provider>… N giây`; for AI local after more than 5 idle minutes it adds that the model may be loading into VRAM. Requests are asynchronous and the Send button becomes Stop, so the map keeps running while it waits.
 - **Keys**: keydown/keyup/keypress events inside the panel are stopped at window capture, so app shortcuts and hold-Space push-to-talk never see chat typing. The OpenAI voice control is unchanged.
 - **Cost readout**: tokens per message from `usage`, with a cost estimate for `claude-sonnet-5-5` ($2 input, $10 output, $2.5 cache write, $0.2 cache read per million tokens).
+
+
+### More CCTV countries and transit regions (October 2026)
+
+Four CCTV packs join the catalog, each with its own env kill switch and cap:
+
+- **Hong Kong** (`hk-td`, `CCTV_HK_TD_*`, default 200 nearest Central, Mong Kok
+  and Sha Tin): the Transport Department list on DATA.GOV.HK, frames on
+  `tdcctv.data.one.gov.hk`. A travel word in the description ("- Eastbound")
+  sets a high-confidence heading.
+- **Spain** (`dgt`, `CCTV_DGT_*`, default 250 nearest Madrid, Valencia, Sevilla,
+  Zaragoza and Málaga): the DGT DATEX II v3.7 camera publication on `nap.dgt.es`
+  (state roads except the Basque Country and Catalonia), frames on
+  `etraffic.dgt.es`. No heading is derived; `tpegDirectionRoad` is the
+  kilometre-point direction.
+- **New Zealand** (`nzta`, `CCTV_NZTA_*`, default 300): NZTA's traffic REST v5
+  list read as JSON; offline or under-maintenance cameras are skipped and the
+  `direction` field sets the heading.
+- **Ho Chi Minh City** (`hcmc`, `CCTV_HCMC_*`, default 700): the cameras on the
+  public map of `giaothong.hochiminhcity.gov.vn`. The portal has no API; the
+  loader opens the map page for its anonymous session cookies (body not read)
+  and sends the map's own `FolderAjax.SearchQuery` once per catalog refresh.
+  AjaxPro `new Ajax.Web.DataTable(...)` answers are turned into JSON without
+  evaluating them, and anything else outside a string is refused. Only `UP`
+  cameras load; frames come from `render/ImageHandler.ashx?id=<camera id>`.
+  The portal publishes no reuse terms, so the pack is documented for personal
+  local viewing.
+
+The XML packs are read with a byte cap and without following redirects; every
+frame URL is pinned to the publisher's own host (and path, for DGT and NZTA)
+before it is registered. The shipped catalog cap stays 4,000 and is shared
+round-robin, so the largest packs (Ontario, TxDOT, Ho Chi Minh City) are
+thinned first; `CCTV_MAX_SOURCES=5000` loads every Ho Chi Minh City camera.
+
+The Transit registry adds six keyless GTFS-Realtime feeds whose published terms
+were read and are quoted in `src/data/transitFeeds.js`: King County Metro
+(Seattle; its required legend is the attribution), RTD (Denver; registered at
+its `open-data.rtd-denver.com` URL because the `www` link redirects across
+hosts), and, under Licence Ouverte 2.0 from transport.data.gouv.fr, Lignes
+d'Azur (Nice), Divia (Dijon, trams from route ids `4-T1`/`4-T2`), Le Met' (Metz)
+and Bibus (Brest). SEPTA was left out because its licence covers schedule data
+only, ZTP Kraków because no terms text could be found, Bordeaux because its
+feed needs a key, and Rouen because its listed feed is an unofficial relay.
 
 ### AI HUD Summary (June 2026)
 
