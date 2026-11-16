@@ -112,9 +112,9 @@
       (t) => t.status !== 'done',
     ).length;
     const nav = (page, label, icon, extra = '') =>
-      `<a class="nav ${r.page === page ? 'on' : ''}" href="#/${page}"><span class="ico">${icon}</span>${label}${extra}</a>`;
+      `<a class="nav ${r.page === page ? 'on' : ''}" href="#${page}"><span class="ico">${icon}</span>${label}${extra}</a>`;
     const projLink = (p) =>
-      `<a class="nav sm ${r.page === 'p' && r.id === p.id ? 'on' : ''}" href="#/p/${p.id}"><i class="dot" style="background:${p.color}"></i><span class="ell">${esc(p.name)}</span></a>`;
+      `<a class="nav sm ${r.page === 'p' && r.id === p.id ? 'on' : ''}" href="#p-${p.id}"><i class="dot" style="background:${p.color}"></i><span class="ell">${esc(p.name)}</span></a>`;
     return `
       <div class="brand"><span class="logo">W</span>WorkBoard<button class="menu-btn" data-act="toggle-side" aria-label="Mở menu">☰</button></div>
       <nav class="side-body ${ui().sideOpen ? 'open' : ''}">
@@ -216,7 +216,7 @@
     const card = (p) => {
       const pr = WB.progress(WB.tasksOf(p.id));
       const c = WB.counts(WB.tasksOf(p.id));
-      return `<a class="pcard" href="#/p/${p.id}" style="--c:${p.color}">
+      return `<a class="pcard" href="#p-${p.id}" style="--c:${p.color}">
         <div class="pcard-top"><span class="kind">${p.kind === 'project' ? 'Dự án' : 'Nhóm'}</span>${
           p.kind === 'project'
             ? `<span class="stage" style="--c:${STAGES[p.stage].color}">${STAGES[p.stage].label}</span>`
@@ -276,7 +276,7 @@
   V.project = (id, view) => {
     const p = WB.project(id);
     if (!p)
-      return `<header class="page-head"><h1>Không tìm thấy</h1></header>${empty('Dự án này không còn nữa. <a href="#/projects">Về danh sách dự án</a>')}`;
+      return `<header class="page-head"><h1>Không tìm thấy</h1></header>${empty('Dự án này không còn nữa. <a href="#projects">Về danh sách dự án</a>')}`;
     const tabs =
       p.kind === 'project'
         ? [
@@ -309,7 +309,7 @@
     return `
       <header class="page-head proj">
         <div class="grow">
-          <div class="crumbs"><a href="#/projects">Dự án & Nhóm</a> › ${d ? esc(d.name) : 'Chưa thuộc phòng ban'}</div>
+          <div class="crumbs"><a href="#projects">Dự án & Nhóm</a> › ${d ? esc(d.name) : 'Chưa thuộc phòng ban'}</div>
           <h1><i class="dot lg" style="background:${p.color}"></i>${esc(p.name)}
             <span class="kind">${p.kind === 'project' ? 'Dự án' : 'Nhóm'}</span>
             ${p.kind === 'project' ? `<span class="stage" style="--c:${STAGES[p.stage].color}">${STAGES[p.stage].label}</span>` : ''}
@@ -327,7 +327,7 @@
         </div>
       </header>
       <div class="toolbar">
-        <div class="tabs">${tabs.map(([k, l]) => `<a class="tab ${view === k ? 'on' : ''}" href="#/p/${p.id}/${k}">${l}</a>`).join('')}</div>
+        <div class="tabs">${tabs.map(([k, l]) => `<a class="tab ${view === k ? 'on' : ''}" href="#p-${p.id}-${k}">${l}</a>`).join('')}</div>
         ${
           view === 'milestones'
             ? ''
@@ -730,7 +730,7 @@
         .slice(0, 5)
         .map(
           (x) =>
-            `<div class="rank"><a href="#/members/${x.u.id}">${avatar(x.u, 'sm')} ${esc(x.u.name)}</a><b>${x[key]} ${unit}</b></div>`,
+            `<div class="rank"><a href="#member-${x.u.id}">${avatar(x.u, 'sm')} ${esc(x.u.name)}</a><b>${x[key]} ${unit}</b></div>`,
         )
         .join('') || '<div class="muted small">Chưa có dữ liệu.</div>';
     return `
@@ -767,7 +767,7 @@
           .projects.map((p) => {
             const k = WB.counts(WB.tasksOf(p.id));
             const pr = WB.progress(WB.tasksOf(p.id));
-            return `<tr><td><a href="#/p/${p.id}"><i class="dot" style="background:${p.color}"></i> ${esc(p.name)}</a></td><td>${p.kind === 'project' ? 'Dự án' : 'Nhóm'}</td>
+            return `<tr><td><a href="#p-${p.id}"><i class="dot" style="background:${p.color}"></i> ${esc(p.name)}</a></td><td>${p.kind === 'project' ? 'Dự án' : 'Nhóm'}</td>
             <td>${p.kind === 'project' ? `<span class="stage" style="--c:${STAGES[p.stage].color}">${STAGES[p.stage].label}</span>` : '—'}</td>
             <td>${k.total}</td><td>${k.done + k.late}</td><td class="${k.overdue ? 'red' : ''}">${k.overdue}</td><td>${k.review}</td><td>${bar(pr.pct, p.color)} ${pr.pct}%</td></tr>`;
           })
@@ -802,7 +802,7 @@
       <tbody>${st()
         .users.map((u) => {
           const c = memberCounts(u.id);
-          return `<tr data-act="go" data-href="#/members/${u.id}"><td>${avatar(u, 'sm')} <strong>${esc(u.name)}</strong>${u.id === st().me ? ' <span class="kind">Bạn</span>' : ''}</td>
+          return `<tr data-act="go" data-href="#member-${u.id}"><td>${avatar(u, 'sm')} <strong>${esc(u.name)}</strong>${u.id === st().me ? ' <span class="kind">Bạn</span>' : ''}</td>
           <td>${esc(u.title || '')}</td><td>${c.todo}</td><td>${c.doing}</td><td>${c.done}</td><td class="${c.overdue ? 'red' : ''}">${c.overdue}</td><td>${c.total}</td></tr>`;
         })
         .join('')}</tbody>
@@ -821,11 +821,10 @@
       .filter(([, list]) => list.length);
     return `
       <header class="page-head">
-        <div><div class="crumbs"><a href="#/members">Thành viên</a> › Báo cáo</div>
+        <div><div class="crumbs"><a href="#members">Thành viên</a> › Báo cáo</div>
           <h1>${avatar(u)} ${esc(u.name)}</h1><p class="sub">${esc(u.title || '')}</p></div>
         <div class="actions no-print">
           <button class="btn" data-act="export-member" data-id="${u.id}">Xuất Excel (CSV)</button>
-          <button class="btn" data-act="print">In báo cáo</button>
           <button class="btn danger" data-act="del-member" data-id="${u.id}">Xóa thành viên</button>
         </div>
       </header>
@@ -835,7 +834,7 @@
         groups
           .map(
             ([p, list]) =>
-              `<section class="panel"><h2><a href="#/p/${p.id}"><i class="dot" style="background:${p.color}"></i> ${esc(p.name)}</a> <span class="n">${list.length}</span></h2>${list.map((t) => taskRow(t)).join('')}</section>`,
+              `<section class="panel"><h2><a href="#p-${p.id}"><i class="dot" style="background:${p.color}"></i> ${esc(p.name)}</a> <span class="n">${list.length}</span></h2>${list.map((t) => taskRow(t)).join('')}</section>`,
           )
           .join('') ||
         `<section class="panel">${empty('Người này chưa được giao việc nào.')}</section>`
@@ -874,7 +873,7 @@
           <button class="icon-btn" data-act="del-task" data-id="${t.id}" title="Xóa công việc">🗑</button>
           <button class="icon-btn" data-act="close-drawer" title="Đóng (Esc)">✕</button></div>
         <div class="drawer-body" data-scroll="drawer:${t.id}">
-          <div class="crumbs"><a href="#/p/${p.id}" data-act="close-drawer-soft"><i class="dot" style="background:${p.color}"></i> ${esc(p.name)}</a>${
+          <div class="crumbs"><a href="#p-${p.id}" data-act="close-drawer-soft"><i class="dot" style="background:${p.color}"></i> ${esc(p.name)}</a>${
             parent
               ? ` › <button class="link" data-act="open-task" data-id="${parent.id}">${esc(parent.name)}</button>`
               : ''

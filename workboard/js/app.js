@@ -110,10 +110,17 @@
 
   // ---------- routing ----------
   function parseRoute() {
-    const [page = 'my', id = '', view = ''] = location.hash
-      .replace(/^#\/?/, '')
-      .split('/')
-      .filter(Boolean);
+    // Addresses are plain words (#projects, #p-<id>-<view>, #member-<id>) so they survive inside a hosted frame.
+    const raw = location.hash.replace(/^#\/?/, '');
+    let page = 'my';
+    let id = '';
+    let view = '';
+    let m;
+    if ((m = raw.match(/^p-([a-z0-9]+)(?:-([a-z]+))?$/i)))
+      [page, id, view] = ['p', m[1], m[2] || ''];
+    else if ((m = raw.match(/^member-([a-z0-9]+)$/i)))
+      [page, id] = ['members', m[1]];
+    else if (['my', 'projects', 'reports', 'members'].includes(raw)) page = raw;
     const prev = ui.route;
     ui.route = { page, id, view: page === 'p' ? view || 'list' : '' };
     if (page !== prev.page || id !== prev.id) {
@@ -130,22 +137,115 @@
 
   // ---------- helpers for handlers ----------
   const cur = () => WB.task(ui.taskId);
-  const ask = (text, value = '') => {
-    const v = prompt(text, value);
-    return v == null ? null : v.trim();
-  };
-  function download(name, rows) {
-    const cell = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
-    const csv = '﻿' + rows.map((r) => r.map(cell).join(',')).join('\r\n');
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(
-      new Blob([csv], { type: 'text/csv;charset=utf-8' }),
-    );
-    a.download = name;
-    document.body.append(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+
+  // In-page dialogs. A hosted page cannot use the browser's own confirm/prompt boxes
+  // (they answer "no" instantly), so every question is asked inside the page.
+  let dialog = null;
+  let confirmed = false;
+  function openDialog(d) {
+    dialog = d;
+    const e = WB.esc;
+    $('#dialog').innerHTML =
+      `<div class="dialog-back" data-act="dialog-cancel"></div>
+      <div class="dialog" role="alertdialog" aria-modal="true" aria-label="${e(d.ok || 'Xác nhận')}">
+        <p>${e(d.text)}</p>
+        ${d.input != null ? `<input class="inp" id="dialog-input" value="${e(d.input)}" aria-label="${e(d.text)}" autocomplete="off" />` : ''}
+        ${d.copy != null ? `<textarea class="inp" id="dialog-copy" readonly aria-label="Bảng dữ liệu">${e(d.copy)}</textarea>` : ''}
+        <div class="modal-foot"><span class="grow"></span>
+          <button class="btn" data-act="dialog-cancel">${e(d.cancel || 'Hủy')}</button>
+          <button class="btn ${d.danger ? 'danger-fill' : 'primary'}" id="dialog-ok" data-act="dialog-ok">${e(d.ok || 'Đồng ý')}</button>
+        </div>
+      </div>`;
+    const input = $('#dialog-input');
+    (input || $('#dialog-ok')).focus();
+    if (input) input.select();
+  }
+  function closeDialog() {
+    dialog = null;
+    $('#dialog').innerHTML = '';
+  }
+  // Use as: if (!sure('Delete?', () => sameHandlerAgain(), {...})) return;
+  // First call opens the question and returns false; pressing OK runs the handler again, and this time it returns true.
+  function sure(text, again, opts = {}) {
+    if (confirmed) return true;
+    openDialog({
+      text,
+      ...opts,
+      onOk() {
+        confirmed = true;
+        try {
+          again();
+        } finally {
+          confirmed = false;
+        }
+      },
+    });
+    return false;
+  }
+  const ask = (text, value, onOk) =>
+    openDialog({ text, input: value || '', ok: 'Lưu', onOk });
+
+  // Saving a file: a hosted page must ask the host to save it; a page opened straight from disk can use a normal download.
+  const hostSave =
+    window.claude && typeof window.claude.use === 'function'
+      ? window.claude.use('downloads').catch(() => null)
+      : null;
+  async function download(name, rows) {
+    const clean = (v) => String(v ?? '');
+    const csv =
+      String.fromCharCode(0xfeff) +
+      rows
+        .map((r) => r.map((v) => `"${clean(v).replace(/"/g, '""')}"`).join(','))
+        .join('\r\n');
+    if (!hostSave) {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(
+        new Blob([csv], { type: 'text/csv;charset=utf-8' }),
+      );
+      a.download = name;
+      document.body.append(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+      return;
+    }
+    const saver = await hostSave;
+    if (saver) {
+      try {
+        await saver.save({ filename: name, data: csv });
+        return toast('Đã lưu file.');
+      } catch (err) {
+        const code = err && err.code;
+        if (code === 'declined') return;
+        if (code === 'rate_limited')
+          return toast(
+            'Đang có một yêu cầu lưu file khác. Hãy thử lại sau giây lát.',
+          );
+      }
+    }
+    // No way to save a file in this view: hand over the table as text that pastes straight into a spreadsheet.
+    const table = rows
+      .map((r) => r.map((v) => clean(v).replace(/\s+/g, ' ')).join('\t'))
+      .join('\n');
+    openDialog({
+      text: 'Ở đây không tải file trực tiếp được. Hãy sao chép bảng dưới đây rồi dán vào Excel hoặc Google Sheets.',
+      copy: table,
+      ok: 'Sao chép',
+      cancel: 'Đóng',
+      keep: true,
+      onOk() {
+        const box = $('#dialog-copy');
+        const manual = () => {
+          box.focus();
+          box.select();
+          toast('Đã chọn sẵn bảng. Nhấn Ctrl+C (máy Mac: ⌘C) để sao chép.');
+        };
+        if (!navigator.clipboard) return manual();
+        navigator.clipboard
+          .writeText(table)
+          .then(() => toast('Đã sao chép. Mở Excel rồi dán vào.'), manual);
+      },
+    });
   }
   function taskRows(tasks) {
     const name = (x) => (x ? x.name : '');
@@ -217,8 +317,10 @@
         const left = WB.blockers(t);
         if (
           left.length &&
-          !confirm(
+          !sure(
             `Việc này phụ thuộc vào ${left.length} việc chưa xong:\n- ${left.map((b) => b.name).join('\n- ')}\n\nVẫn đánh dấu hoàn thành?`,
+            () => acts['toggle-done'](el),
+            { ok: 'Vẫn hoàn thành' },
           )
         )
           return;
@@ -237,8 +339,10 @@
       const t = WB.task(el.dataset.id);
       const n = WB.subs(t.id).length;
       if (
-        !confirm(
+        !sure(
           `Xóa công việc “${t.name}”${n ? ` và ${n} công việc con` : ''}? Không khôi phục được.`,
+          () => acts['del-task'](el),
+          { ok: 'Xóa', danger: true },
         )
       )
         return;
@@ -291,17 +395,19 @@
     },
     'rename-tasklist'(el) {
       const l = WB.tasklist(el.dataset.id);
-      const v = ask('Tên mới của danh sách việc:', l.name);
-      if (!v) return;
-      l.name = v;
-      commit();
+      ask('Tên mới của danh sách việc:', l.name, (v) => {
+        l.name = v;
+        commit();
+      });
     },
     'del-tasklist'(el) {
       const l = WB.tasklist(el.dataset.id);
       const n = WB.state.tasks.filter((t) => t.tasklistId === l.id).length;
       if (
-        !confirm(
+        !sure(
           `Xóa danh sách việc “${l.name}”${n ? ` cùng ${n} công việc bên trong` : ''}? Không khôi phục được.`,
+          () => acts['del-tasklist'](el),
+          { ok: 'Xóa', danger: true },
         )
       )
         return;
@@ -311,8 +417,10 @@
     'del-milestone'(el) {
       const m = WB.milestone(el.dataset.id);
       if (
-        !confirm(
+        !sure(
           `Xóa mục tiêu “${m.name}”? Các công việc vẫn giữ nguyên, chỉ bỏ gắn với mục tiêu này.`,
+          () => acts['del-milestone'](el),
+          { ok: 'Xóa', danger: true },
         )
       )
         return;
@@ -336,8 +444,10 @@
       const p = WB.project(el.dataset.id);
       const n = WB.tasksOf(p.id).length;
       if (
-        !confirm(
+        !sure(
           `Xóa “${p.name}” cùng ${n} công việc bên trong? Không khôi phục được.`,
+          () => acts['del-project'](el),
+          { ok: 'Xóa', danger: true },
         )
       )
         return;
@@ -345,7 +455,7 @@
       ui.modal = null;
       ui.taskId = '';
       WB.save();
-      location.hash = '#/projects';
+      location.hash = '#projects';
       render();
     },
     'new-dept'() {
@@ -355,17 +465,19 @@
     },
     'rename-dept'(el) {
       const d = WB.dept(el.dataset.id);
-      const v = ask('Tên mới của phòng ban:', d.name);
-      if (!v) return;
-      d.name = v;
-      commit();
+      ask('Tên mới của phòng ban:', d.name, (v) => {
+        d.name = v;
+        commit();
+      });
     },
     'del-dept'(el) {
       const d = WB.dept(el.dataset.id);
       const n = WB.state.projects.filter((p) => p.deptId === d.id).length;
       if (
-        !confirm(
+        !sure(
           `Xóa phòng ban “${d.name}”?${n ? ` ${n} dự án/nhóm bên trong sẽ không bị xóa, chỉ chuyển về “Chưa thuộc phòng ban”.` : ''}`,
+          () => acts['del-dept'](el),
+          { ok: 'Xóa', danger: true },
         )
       )
         return;
@@ -389,8 +501,10 @@
         );
       const n = WB.state.tasks.filter((t) => t.assigneeId === u.id).length;
       if (
-        !confirm(
+        !sure(
           `Xóa thành viên ${u.name}?${n ? ` ${n} công việc của người này sẽ chuyển thành “Chưa giao”.` : ''}`,
+          () => acts['del-member'](el),
+          { ok: 'Xóa', danger: true },
         )
       )
         return;
@@ -404,7 +518,7 @@
       WB.state.users = WB.state.users.filter((x) => x.id !== u.id);
       if (WB.state.me === u.id) WB.state.me = WB.state.users[0].id;
       WB.save();
-      location.hash = '#/members';
+      location.hash = '#members';
       render();
     },
     'close-modal'() {
@@ -422,23 +536,33 @@
         taskRows(WB.state.tasks.filter((t) => t.assigneeId === u.id)),
       );
     },
-    print() {
-      window.print();
-    },
     'reset-data'() {
       if (
-        !confirm(
+        !sure(
           'Xóa toàn bộ dữ liệu hiện tại và nạp lại dữ liệu mẫu? Không khôi phục được.',
+          () => acts['reset-data'](),
+          { ok: 'Nạp lại dữ liệu mẫu', danger: true },
         )
       )
         return;
       WB.reset();
       ui.taskId = '';
       ui.modal = null;
-      location.hash = '#/my';
+      location.hash = '#my';
       render();
       toast('Đã nạp lại dữ liệu mẫu.');
     },
+  };
+
+  acts['dialog-cancel'] = closeDialog;
+  acts['dialog-ok'] = () => {
+    const d = dialog;
+    if (!d) return;
+    const input = $('#dialog-input');
+    const value = input ? input.value.replace(/\s+/g, ' ').trim() : '';
+    if (input && !value) return input.focus();
+    if (!d.keep) closeDialog();
+    if (d.onOk) d.onOk(value);
   };
 
   // ---------- "value changed" handlers ----------
@@ -592,8 +716,8 @@
       }
       ui.modal = null;
       WB.save();
-      if (location.hash === `#/p/${p.id}` || ui.route.id === p.id) render();
-      else location.hash = `#/p/${p.id}`;
+      if (location.hash === `#p-${p.id}` || ui.route.id === p.id) render();
+      else location.hash = `#p-${p.id}`;
     },
     'save-dept'(form, data) {
       const name = data.get('name').trim();
@@ -662,6 +786,11 @@
   });
   document.addEventListener('keydown', (e) => {
     if (e.isComposing) return;
+    if (dialog && e.key === 'Escape') return closeDialog();
+    if (dialog && e.key === 'Enter' && e.target.id === 'dialog-input') {
+      e.preventDefault();
+      return acts['dialog-ok']();
+    }
     if (e.key === 'Enter') {
       const el = e.target;
       if (el.matches('textarea.title-inp')) {
