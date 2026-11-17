@@ -44,6 +44,7 @@
   let recovering = false;
   let lastLoad = 0;
   let renderTimer = 0;
+  let catchUp = 0;
   let status = { state: 'ok', text: '' };
   const inflight = new Map();
   const deferred = new Map();
@@ -724,7 +725,10 @@
     WB.ready();
     if (note) WB.toast(note);
   }
-  async function reload() {
+  // Fetch everything again. Queued after any saves still on their way, so a
+  // half-sent change is never overwritten by an older copy from the server.
+  const reload = () => (queue = queue.then(fetchAgain, fetchAgain));
+  async function fetchAgain() {
     if (!ws) return;
     try {
       const prev = WB.ui.taskId;
@@ -862,7 +866,7 @@
       const text = message(err);
       setStatus('error', text);
       WB.toast(`Chưa lưu được: ${text} Đang tải lại dữ liệu mới nhất…`);
-      await reload();
+      await fetchAgain();
     } finally {
       ids.forEach((id) => {
         const n = (inflight.get(id) || 1) - 1;
@@ -970,13 +974,17 @@
       .subscribe((state) => {
         if (state === 'SUBSCRIBED') {
           if (status.state === 'offline') setStatus('ok');
-          // Changes made while the connection was down are fetched again.
-          if (Date.now() - lastLoad > 5000) reload();
+          // Live changes start arriving a few seconds after this point, so fetch once
+          // more afterwards: nothing changed by others in the meantime is missed,
+          // including while the connection was down.
+          clearTimeout(catchUp);
+          catchUp = setTimeout(reload, 4000);
         } else if (state === 'CHANNEL_ERROR' || state === 'TIMED_OUT')
           setStatus('offline');
       });
   }
   function unsubscribe() {
+    clearTimeout(catchUp);
     if (channel) sb.removeChannel(channel);
     channel = null;
   }

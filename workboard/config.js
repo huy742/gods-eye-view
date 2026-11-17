@@ -4,6 +4,6 @@
 // supabaseKey: the "publishable" (or legacy "anon") key. It is meant to be public;
 // the database's security rules decide what each signed-in person may see.
 window.WB_CONFIG = {
-  supabaseUrl: '',
-  supabaseKey: '',
+  supabaseUrl: 'https://vgjsrpgffmjvfutecuyh.supabase.co',
+  supabaseKey: 'sb_publishable_vp-5n1mfHBVJ_7O7kow1Vw_-PZ_z0Qt',
 };
