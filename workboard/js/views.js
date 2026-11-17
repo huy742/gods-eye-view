@@ -1,30 +1,26 @@
 'use strict';
-// Views: each function returns an HTML string. No state is changed here.
+// Views, part 1: building blocks, sidebar, "my tasks", projects and the project views.
+// Every function returns an HTML string; nothing here changes data.
 (() => {
-  const { esc, STATUS, STAGES } = WB;
-  const V = (WB.views = {});
+  const { esc, STATUS, STAGES, fmtDate } = WB;
+  const V = (WB.views = WB.views || {});
   const st = () => WB.state;
   const ui = () => WB.ui;
   const DAY = 864e5;
 
-  // ---------- small building blocks ----------
+  // ---------- building blocks ----------
   const initial = (name) => {
-    const parts = name.trim().split(/\s+/);
+    const parts = String(name || '?')
+      .trim()
+      .split(/\s+/);
     return (parts[parts.length - 1][0] || '?').toUpperCase();
   };
   const avatar = (u, cls = '') =>
     u
-      ? `<span class="av ${cls}" style="background:${u.color}" title="${esc(u.name)}">${esc(initial(u.name))}</span>`
+      ? `<span class="av ${cls}" style="background:${esc(u.color || '#64748b')}" title="${esc(u.name)}">${esc(initial(u.name))}</span>`
       : `<span class="av av-none ${cls}" title="Chưa giao cho ai">?</span>`;
   const pill = (key) =>
     `<span class="pill" style="--c:${STATUS[key].color}">${STATUS[key].label}</span>`;
-  const fmtDate = (s) => {
-    if (!s) return '';
-    const [d, t] = s.split('T');
-    const [y, m, dd] = d.split('-');
-    const yr = +y === new Date().getFullYear() ? '' : '/' + y;
-    return `${dd}/${m}${yr}${t ? ' ' + t : ''}`;
-  };
   const options = (list, selected, empty) =>
     (empty === undefined ? '' : `<option value="">${esc(empty)}</option>`) +
     list
@@ -36,21 +32,35 @@
   const flags = (t) =>
     (t.important ? '<span class="flag imp">Quan trọng</span>' : '') +
     (t.urgent ? '<span class="flag urg">Khẩn cấp</span>' : '');
+  const svg = (inner, size = 17) =>
+    `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${inner}</svg>`;
+  const ICON = {
+    check: '<path d="M4 12l5 5L20 6"/>',
+    board:
+      '<rect x="3" y="4" width="7" height="16" rx="1.5"/><rect x="14" y="4" width="7" height="10" rx="1.5"/>',
+    chart: '<path d="M5 20V10M12 20V4M19 20v-7"/>',
+    people:
+      '<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"/>',
+    repeat:
+      '<path d="M17 2l4 4-4 4"/><path d="M3 11V9a3 3 0 0 1 3-3h15"/><path d="M7 22l-4-4 4-4"/><path d="M21 13v2a3 3 0 0 1-3 3H3"/>',
+    bell: '<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>',
+    dots: '<circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/>',
+  };
   const badges = (t) => {
     const out = [];
     const sub = WB.subs(t.id);
     if (sub.length)
       out.push(
-        `<span class="bd" title="Công việc con">⑂ ${sub.filter((x) => x.status === 'done').length}/${sub.length}</span>`,
+        `<span class="bd" title="Việc con">⑂ ${sub.filter((x) => x.status === 'done').length}/${sub.length}</span>`,
       );
     if (t.checklist.length)
       out.push(
         `<span class="bd" title="Danh sách kiểm tra">☑ ${t.checklist.filter((c) => c.done).length}/${t.checklist.length}</span>`,
       );
-    if (t.comments.length)
-      out.push(
-        `<span class="bd" title="Bình luận">💬 ${t.comments.length}</span>`,
-      );
+    const nc = WB.commentsOf(t.id).length;
+    if (nc) out.push(`<span class="bd" title="Bình luận">💬 ${nc}</span>`);
+    if (t.repeatId)
+      out.push('<span class="bd" title="Tạo từ việc lặp lại">↻</span>');
     if (t.status !== 'done' && WB.blockers(t).length)
       out.push(
         '<span class="bd blocked" title="Còn việc phải làm trước">⛔ Bị chặn</span>',
@@ -65,7 +75,7 @@
           ? 'Đang chờ duyệt'
           : 'Đánh dấu hoàn thành';
     const mark = t.status === 'done' ? '✓' : t.status === 'review' ? '…' : '';
-    return `<button class="chk ${t.status}" data-act="toggle-done" data-id="${t.id}" title="${title}" aria-label="${title}">${mark}</button>`;
+    return `<button class="chk ${t.status}" data-act="toggle-done" data-id="${t.id}" title="${title}" aria-label="${title}: ${esc(t.name)}">${mark}</button>`;
   };
   const dueCell = (t) => {
     const s = WB.statusOf(t);
@@ -82,15 +92,13 @@
       <span class="tname">${esc(t.name)}</span>
       <span class="tbadges">${flags(t)}${badges(t)}</span>
       <span class="tmeta">
-        ${showProject && p ? `<span class="chip"><i style="background:${p.color}"></i>${esc(p.name)}</span>` : ''}
+        ${showProject && p ? `<span class="chip"><i style="background:${esc(p.color)}"></i>${esc(p.name)}</span>` : ''}
         ${dueCell(t)}
         ${pill(WB.statusOf(t))}
         ${avatar(WB.user(t.assigneeId))}
       </span>
     </div>`;
   };
-  const svg = (inner) =>
-    `<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${inner}</svg>`;
   const empty = (text) => `<div class="empty">${text}</div>`;
   const stackBar = (c) => {
     const keys = ['done', 'late', 'doing', 'review', 'todo', 'overdue'];
@@ -102,8 +110,29 @@
           `<i style="flex:${c[k]};background:${STATUS[k].color}" title="${STATUS[k].label}: ${c[k]}"></i>`,
       )
       .join('')}</div>
-      <div class="legend">${keys.map((k) => `<span><i style="background:${STATUS[k].color}"></i>${STATUS[k].label}: <b>${c[k]}</b></span>`).join('')}</div>`;
+      <div class="legend">${keys
+        .map(
+          (k) =>
+            `<span><i style="background:${STATUS[k].color}"></i>${STATUS[k].label}: <b>${c[k]}</b></span>`,
+        )
+        .join('')}</div>`;
   };
+  Object.assign(V, {
+    initial,
+    avatar,
+    pill,
+    options,
+    flags,
+    svg,
+    ICON,
+    badges,
+    checkBtn,
+    dueCell,
+    bar,
+    taskRow,
+    empty,
+    stackBar,
+  });
 
   // ---------- sidebar ----------
   V.side = () => {
@@ -111,44 +140,51 @@
     const open = WB.myTasks('assigned').filter(
       (t) => t.status !== 'done',
     ).length;
+    const unread = WB.myNotifications().filter((n) => !n.read).length;
     const nav = (page, label, icon, extra = '') =>
-      `<a class="nav ${r.page === page ? 'on' : ''}" href="#${page}"><span class="ico">${icon}</span>${label}${extra}</a>`;
+      `<a class="nav ${r.page === page ? 'on' : ''}" href="#${page}"><span class="ico">${svg(icon)}</span>${label}${extra}</a>`;
     const projLink = (p) =>
-      `<a class="nav sm ${r.page === 'p' && r.id === p.id ? 'on' : ''}" href="#p-${p.id}"><i class="dot" style="background:${p.color}"></i><span class="ell">${esc(p.name)}</span></a>`;
+      `<a class="nav sm ${r.page === 'p' && r.id === p.id ? 'on' : ''}" href="#p-${p.id}"><i class="dot" style="background:${esc(p.color)}"></i><span class="ell">${esc(p.name)}</span>${p.private ? '<span class="lock" title="Chỉ thành viên xem được">🔒</span>' : ''}</a>`;
+    const projects = WB.visibleProjects();
     return `
-      <div class="brand"><span class="logo">W</span>WorkBoard<button class="menu-btn" data-act="toggle-side" aria-label="Mở menu">☰</button></div>
+      <div class="brand"><span class="logo">W</span><span class="brand-name">WorkBoard</span>
+        <button class="bell ${ui().panel === 'notif' ? 'on' : ''}" data-act="toggle-panel" aria-label="Thông báo${unread ? `, ${unread} chưa đọc` : ''}" title="Thông báo">${svg(ICON.bell, 18)}${unread ? `<b class="bell-n">${unread > 99 ? '99+' : unread}</b>` : ''}</button>
+        <button class="menu-btn" data-act="toggle-side" aria-label="Mở menu">☰</button></div>
       <nav class="side-body ${ui().sideOpen ? 'open' : ''}">
-        ${nav('my', 'Việc của tôi', svg('<path d="M4 12l5 5L20 6"/>'), open ? `<b class="count">${open}</b>` : '')}
-        ${nav('projects', 'Dự án & Nhóm', svg('<rect x="3" y="4" width="7" height="16" rx="1.5"/><rect x="14" y="4" width="7" height="10" rx="1.5"/>'))}
-        ${nav('reports', 'Báo cáo', svg('<path d="M5 20V10M12 20V4M19 20v-7"/>'))}
-        ${nav('members', 'Thành viên', svg('<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"/>'))}
+        ${nav('my', 'Việc của tôi', ICON.check, open ? `<b class="count">${open}</b>` : '')}
+        ${nav('projects', 'Dự án & Nhóm', ICON.board)}
+        ${nav('repeats', 'Việc lặp lại', ICON.repeat)}
+        ${nav('reports', 'Báo cáo', ICON.chart)}
+        ${nav('members', 'Thành viên', ICON.people)}
         <div class="side-title">Dự án</div>
         ${
-          st()
-            .projects.filter((p) => p.kind === 'project')
+          projects
+            .filter((p) => p.kind === 'project')
             .map(projLink)
             .join('') || '<div class="side-empty">Chưa có dự án</div>'
         }
         <div class="side-title">Nhóm</div>
         ${
-          st()
-            .projects.filter((p) => p.kind === 'team')
+          projects
+            .filter((p) => p.kind === 'team')
             .map(projLink)
             .join('') || '<div class="side-empty">Chưa có nhóm</div>'
         }
-        <div class="side-foot">
-          <label class="lbl">Bạn đang dùng với tên</label>
-          <div class="who">${avatar(WB.me())}<select data-chg="switch-user" aria-label="Đổi người dùng">${options(st().users, st().me)}</select></div>
-          <button class="link" data-act="reset-data">Khôi phục dữ liệu mẫu</button>
-        </div>
+        <div class="side-foot">${V.sideFoot()}</div>
       </nav>`;
   };
+  V.sideFoot = () => `
+    <label class="lbl" for="switch-user">Bạn đang dùng với tên</label>
+    <div class="who">${avatar(WB.me())}<select id="switch-user" data-chg="switch-user">${options(st().users, st().me)}</select></div>
+    <p class="side-note">Bản này lưu dữ liệu trên trình duyệt của bạn. Đổi tên ở trên để thử vai người khác.</p>
+    <button class="link" data-act="reset-data">Khôi phục dữ liệu mẫu</button>`;
 
   // ---------- page router ----------
   V.main = () => {
     const r = ui().route;
     if (r.page === 'projects') return V.projects();
     if (r.page === 'p') return V.project(r.id, r.view);
+    if (r.page === 'repeats') return V.repeats();
     if (r.page === 'reports') return V.reports();
     if (r.page === 'members') return r.id ? V.member(r.id) : V.members();
     return V.my();
@@ -165,8 +201,8 @@
     const all = WB.myTasks(tab);
     const open = all.filter((t) => t.status !== 'done');
     const done = all.filter((t) => t.status === 'done');
-    const today = WB.ymd(new Date());
-    const week = WB.ymd(WB.addDays(new Date(), 7));
+    const today = WB.today();
+    const week = WB.shiftDate(today, 7);
     const groups = [
       ['Quá hạn', open.filter((t) => WB.statusOf(t) === 'overdue'), 'red'],
       [
@@ -189,7 +225,12 @@
       <header class="page-head">
         <div><h1>Việc của tôi</h1><p class="sub">Xin chào ${esc(WB.me().name)} — bạn còn <b>${WB.myTasks('assigned').filter((t) => t.status !== 'done').length}</b> việc chưa xong.</p></div>
       </header>
-      <div class="tabs">${tabs.map(([k, l]) => `<button class="tab ${tab === k ? 'on' : ''}" data-act="my-tab" data-tab="${k}">${l} <span class="n">${WB.myTasks(k).filter((t) => t.status !== 'done').length}</span></button>`).join('')}</div>
+      <div class="tabs page-tabs">${tabs
+        .map(
+          ([k, l]) =>
+            `<button class="tab ${tab === k ? 'on' : ''}" data-act="my-tab" data-tab="${k}">${l} <span class="n">${WB.myTasks(k).filter((t) => t.status !== 'done').length}</span></button>`,
+        )
+        .join('')}</div>
       <section class="panel">
         ${
           groups
@@ -205,7 +246,9 @@
         }
         ${
           done.length
-            ? `<details class="done-box"><summary>Đã hoàn thành (${done.length})</summary>${done.map((t) => taskRow(t, { showProject: true })).join('')}</details>`
+            ? `<details class="done-box"><summary>Đã hoàn thành (${done.length})</summary>${done
+                .map((t) => taskRow(t, { showProject: true }))
+                .join('')}</details>`
             : ''
         }
       </section>`;
@@ -216,12 +259,12 @@
     const card = (p) => {
       const pr = WB.progress(WB.tasksOf(p.id));
       const c = WB.counts(WB.tasksOf(p.id));
-      return `<a class="pcard" href="#p-${p.id}" style="--c:${p.color}">
+      return `<a class="pcard" href="#p-${p.id}" style="--c:${esc(p.color)}">
         <div class="pcard-top"><span class="kind">${p.kind === 'project' ? 'Dự án' : 'Nhóm'}</span>${
           p.kind === 'project'
             ? `<span class="stage" style="--c:${STAGES[p.stage].color}">${STAGES[p.stage].label}</span>`
             : ''
-        }</div>
+        }${p.private ? '<span class="kind" title="Chỉ thành viên xem được">🔒 Riêng tư</span>' : ''}</div>
         <h3>${esc(p.name)}</h3>
         <p class="muted small">${p.start || p.end ? `${fmtDate(p.start) || '…'} → ${fmtDate(p.end) || '…'}` : 'Công việc lặp lại, không có ngày kết thúc'}</p>
         <div class="pcard-prog">${bar(pr.pct, p.color)}<span>${pr.done}/${pr.total} việc</span></div>
@@ -233,35 +276,56 @@
           )}</span>${c.overdue ? `<span class="red small">${c.overdue} quá hạn</span>` : ''}</div>
       </a>`;
     };
+    const canManageDepts = WB.mode !== 'cloud' || WB.isWorkspaceAdmin();
+    const visible = WB.visibleProjects();
     const section = (d) => {
-      const list = st().projects.filter((p) => p.deptId === (d ? d.id : ''));
+      const list = visible.filter((p) =>
+        d ? p.deptId === d.id : !WB.dept(p.deptId),
+      );
       if (!d && !list.length) return '';
       return `<section class="dept">
         <h2>${d ? esc(d.name) : 'Chưa thuộc phòng ban'} <span class="n">${list.length}</span>
-          ${d ? `<button class="icon-btn" data-act="rename-dept" data-id="${d.id}" title="Đổi tên phòng ban">✎</button><button class="icon-btn" data-act="del-dept" data-id="${d.id}" title="Xóa phòng ban">🗑</button>` : ''}
+          ${d && canManageDepts ? `<button class="icon-btn" data-act="rename-dept" data-id="${d.id}" title="Đổi tên phòng ban" aria-label="Đổi tên phòng ban ${esc(d.name)}">✎</button><button class="icon-btn" data-act="del-dept" data-id="${d.id}" title="Xóa phòng ban" aria-label="Xóa phòng ban ${esc(d.name)}">🗑</button>` : ''}
         </h2>
         <div class="pgrid">${list.map(card).join('') || '<div class="muted small">Phòng ban này chưa có dự án hay nhóm nào.</div>'}</div>
       </section>`;
     };
+    const none = !visible.length;
     return `
       <header class="page-head">
         <div><h1>Dự án & Nhóm</h1><p class="sub">Dự án có ngày bắt đầu, ngày kết thúc và mục tiêu. Nhóm dành cho việc lặp lại hằng tuần, hằng tháng.</p></div>
         <div class="actions">
-          <button class="btn" data-act="new-dept">+ Phòng ban</button>
+          ${canManageDepts ? '<button class="btn" data-act="new-dept">+ Phòng ban</button>' : ''}
+          <button class="btn" data-act="new-from-template">+ Từ mẫu</button>
           <button class="btn" data-act="new-project" data-kind="team">+ Nhóm</button>
           <button class="btn primary" data-act="new-project" data-kind="project">+ Dự án</button>
         </div>
       </header>
+      ${none ? `<section class="panel">${empty('Chưa có dự án hay nhóm nào. Bấm <b>+ Dự án</b> để tạo, hoặc <b>+ Từ mẫu</b> để bắt đầu từ một mẫu có sẵn.')}${WB.mode === 'cloud' && WB.cloud && WB.cloud.canSeed() ? '<p class="center"><button class="btn" data-act="cloud-seed">Thêm dữ liệu mẫu để thử</button></p>' : ''}</section>` : ''}
       ${st().departments.map(section).join('')}${section(null)}`;
   };
 
   // ---------- one project / team ----------
+  const VIEWS_PROJECT = [
+    ['list', 'Danh sách'],
+    ['table', 'Bảng'],
+    ['kanban', 'Kanban'],
+    ['gantt', 'Gantt'],
+    ['calendar', 'Lịch'],
+    ['period', 'Theo kỳ'],
+    ['stream', 'Hoạt động'],
+    ['milestones', 'Mục tiêu'],
+  ];
+  const VIEWS_TEAM = VIEWS_PROJECT.filter(
+    ([k]) => !['gantt', 'milestones'].includes(k),
+  );
+  V.VIEW_NAMES = VIEWS_PROJECT.map(([k]) => k);
   const applyFilter = (tasks) => {
     const f = ui().filter;
-    const q = f.q.trim().toLowerCase();
+    const q = WB.norm(f.q);
     return tasks.filter(
       (t) =>
-        (!q || t.name.toLowerCase().includes(q)) &&
+        (!q || WB.norm(t.name).includes(q)) &&
         (!f.assignee || t.assigneeId === f.assignee) &&
         (!f.status || WB.statusOf(t) === f.status),
     );
@@ -275,45 +339,36 @@
 
   V.project = (id, view) => {
     const p = WB.project(id);
-    if (!p)
-      return `<header class="page-head"><h1>Không tìm thấy</h1></header>${empty('Dự án này không còn nữa. <a href="#projects">Về danh sách dự án</a>')}`;
-    const tabs =
-      p.kind === 'project'
-        ? [
-            ['list', 'Danh sách'],
-            ['table', 'Bảng'],
-            ['kanban', 'Kanban'],
-            ['gantt', 'Gantt'],
-            ['calendar', 'Lịch'],
-            ['milestones', 'Mục tiêu'],
-          ]
-        : [
-            ['list', 'Danh sách'],
-            ['kanban', 'Kanban'],
-            ['calendar', 'Lịch'],
-          ];
+    if (!p || !WB.canSee(p))
+      return `<header class="page-head"><h1>Không tìm thấy</h1></header>${empty('Dự án này không còn nữa, hoặc bạn không có quyền xem. <a href="#projects">Về danh sách dự án</a>')}`;
+    const tabs = p.kind === 'project' ? VIEWS_PROJECT : VIEWS_TEAM;
     if (!tabs.some(([k]) => k === view)) view = 'list';
     const all = WB.tasksOf(id);
     const pr = WB.progress(all);
     const tasks = applyFilter(WB.topTasks(id));
     const f = ui().filter;
     const d = WB.dept(p.deptId);
+    const admin = WB.isAdmin(p);
     const body = {
       list: V.list,
       table: V.table,
       kanban: V.kanban,
       gantt: V.gantt,
       calendar: V.calendar,
+      period: V.period,
+      stream: V.stream,
       milestones: V.milestones,
     }[view](p, tasks);
+    const noFilter = ['milestones', 'stream'].includes(view);
     return `
       <header class="page-head proj">
         <div class="grow">
           <div class="crumbs"><a href="#projects">Dự án & Nhóm</a> › ${d ? esc(d.name) : 'Chưa thuộc phòng ban'}</div>
-          <h1><i class="dot lg" style="background:${p.color}"></i>${esc(p.name)}
+          <h1><i class="dot lg" style="background:${esc(p.color)}"></i>${esc(p.name)}
             <span class="kind">${p.kind === 'project' ? 'Dự án' : 'Nhóm'}</span>
             ${p.kind === 'project' ? `<span class="stage" style="--c:${STAGES[p.stage].color}">${STAGES[p.stage].label}</span>` : ''}
-            ${p.review ? '<span class="kind" title="Việc phải được người quản trị duyệt mới tính là xong">Có duyệt</span>' : ''}
+            ${p.review ? '<span class="kind" title="Việc phải được người giao việc hoặc quản trị dự án duyệt mới tính là xong">Có duyệt</span>' : ''}
+            ${p.private ? '<span class="kind" title="Chỉ thành viên xem được">🔒 Riêng tư</span>' : ''}
           </h1>
           <div class="proj-meta">
             ${p.start || p.end ? `<span>📅 ${fmtDate(p.start) || '…'} → ${fmtDate(p.end) || '…'}</span>` : ''}
@@ -322,23 +377,34 @@
           </div>
         </div>
         <div class="actions">
-          <button class="btn" data-act="export-csv" data-id="${p.id}" title="Tải file mở được bằng Excel">Xuất Excel (CSV)</button>
-          <button class="btn" data-act="edit-project" data-id="${p.id}">Cài đặt</button>
+          <details class="menu">
+            <summary class="btn" aria-label="Thêm thao tác">Thêm ▾</summary>
+            <div class="menu-list" role="menu">
+              <button role="menuitem" data-act="open-import" data-id="${p.id}">Nhập công việc từ Excel…</button>
+              <button role="menuitem" data-act="export-xlsx" data-id="${p.id}">Xuất ra Excel</button>
+              <button role="menuitem" data-act="open-fields" data-id="${p.id}">Trường tùy chỉnh…</button>
+              <button role="menuitem" data-act="new-repeat" data-project="${p.id}">Tạo việc lặp lại…</button>
+              <hr />
+              <button role="menuitem" data-act="open-dup-project" data-id="${p.id}">Nhân bản ${p.kind === 'project' ? 'dự án' : 'nhóm'}…</button>
+              <button role="menuitem" data-act="open-save-template" data-id="${p.id}">Lưu làm mẫu…</button>
+            </div>
+          </details>
+          <button class="btn" data-act="edit-project" data-id="${p.id}">${admin ? 'Cài đặt' : 'Thông tin'}</button>
         </div>
       </header>
       <div class="toolbar">
         <div class="tabs">${tabs.map(([k, l]) => `<a class="tab ${view === k ? 'on' : ''}" href="#p-${p.id}-${k}">${l}</a>`).join('')}</div>
         ${
-          view === 'milestones'
+          noFilter
             ? ''
             : `<div class="filters">
           <input id="f-q" class="inp" data-input="filter-q" value="${esc(f.q)}" placeholder="Tìm công việc…" aria-label="Tìm công việc" />
-          <select class="inp" data-chg="filter" data-key="assignee" aria-label="Lọc theo người">${options(
+          <select id="f-assignee" class="inp" data-chg="filter" data-key="assignee" aria-label="Lọc theo người">${options(
             p.memberIds.map(WB.user).filter(Boolean),
             f.assignee,
             'Mọi người',
           )}</select>
-          <select class="inp" data-chg="filter" data-key="status" aria-label="Lọc theo trạng thái">${options(
+          <select id="f-status" class="inp" data-chg="filter" data-key="status" aria-label="Lọc theo trạng thái">${options(
             Object.entries(STATUS).map(([k, v]) => ({ id: k, name: v.label })),
             f.status,
             'Mọi trạng thái',
@@ -352,6 +418,7 @@
   V.list = (p, tasks) => {
     const lists = WB.listsOf(p.id);
     const filtering = tasks.length !== WB.topTasks(p.id).length;
+    const admin = WB.isAdmin(p);
     return `<section class="panel">
       ${lists
         .map((l, i) => {
@@ -364,10 +431,10 @@
           return `<div class="tl">
             <h3 class="tl-head"><span class="tl-name">${esc(l.name)}</span> <span class="n">${pr.done}/${pr.total}</span>
               <span class="tl-tools">
-                <button class="icon-btn" data-act="move-tasklist" data-id="${l.id}" data-dir="-1" title="Chuyển lên" ${i === 0 ? 'disabled' : ''}>↑</button>
-                <button class="icon-btn" data-act="move-tasklist" data-id="${l.id}" data-dir="1" title="Chuyển xuống" ${i === lists.length - 1 ? 'disabled' : ''}>↓</button>
-                <button class="icon-btn" data-act="rename-tasklist" data-id="${l.id}" title="Đổi tên">✎</button>
-                <button class="icon-btn" data-act="del-tasklist" data-id="${l.id}" title="Xóa danh sách việc">🗑</button>
+                <button class="icon-btn" data-act="move-tasklist" data-id="${l.id}" data-dir="-1" title="Chuyển lên" aria-label="Chuyển “${esc(l.name)}” lên" ${i === 0 ? 'disabled' : ''}>↑</button>
+                <button class="icon-btn" data-act="move-tasklist" data-id="${l.id}" data-dir="1" title="Chuyển xuống" aria-label="Chuyển “${esc(l.name)}” xuống" ${i === lists.length - 1 ? 'disabled' : ''}>↓</button>
+                <button class="icon-btn" data-act="rename-tasklist" data-id="${l.id}" title="Đổi tên" aria-label="Đổi tên “${esc(l.name)}”">✎</button>
+                ${admin ? `<button class="icon-btn" data-act="del-tasklist" data-id="${l.id}" title="Xóa danh sách việc" aria-label="Xóa “${esc(l.name)}”">🗑</button>` : ''}
               </span></h3>
             ${mine
               .map(
@@ -389,6 +456,7 @@
 
   V.table = (p, tasks) => {
     const sort = ui().sort;
+    const fields = WB.fieldsOf(p.id);
     const cols = [
       ['name', 'Tên công việc'],
       ['tasklist', 'Danh sách việc'],
@@ -398,9 +466,10 @@
       ['status', 'Trạng thái'],
       ['flags', 'Nhãn'],
       ['milestone', 'Mục tiêu'],
-    ];
+      ...fields.map((f) => ['f:' + f.id, f.name]),
+    ].filter(([k]) => p.kind === 'project' || k !== 'milestone');
     const val = {
-      name: (t) => t.name.toLowerCase(),
+      name: (t) => WB.norm(t.name),
       tasklist: (t) => (WB.tasklist(t.tasklistId) || {}).name || '',
       assignee: (t) => (WB.user(t.assigneeId) || {}).name || '￿',
       start: (t) => t.start || '9',
@@ -409,18 +478,29 @@
       flags: (t) => -(t.important * 2 + t.urgent),
       milestone: (t) => (WB.milestone(t.milestoneId) || {}).name || '￿',
     };
+    const fieldVal = (t, fid) => {
+      const v = (t.custom || {})[fid];
+      const f = WB.field(fid);
+      if (v == null || v === '')
+        return f && f.type === 'number' ? -Infinity : '￿';
+      return f && f.type === 'number' ? +v : String(v);
+    };
     const rows = [...tasks];
     if (sort.key)
       rows.sort((a, b) => {
-        const x = val[sort.key](a);
-        const y = val[sort.key](b);
+        const get = sort.key.startsWith('f:')
+          ? (t) => fieldVal(t, sort.key.slice(2))
+          : val[sort.key];
+        const x = get(a);
+        const y = get(b);
         return (x > y ? 1 : x < y ? -1 : 0) * sort.dir;
       });
+    const first = WB.listsOf(p.id)[0];
     return `<section class="panel flush"><div class="scroll-x"><table class="tbl">
-      <thead><tr><th class="w-chk"></th>${cols
+      <thead><tr><th class="w-chk"><span class="sr">Xong</span></th>${cols
         .map(
           ([k, l]) =>
-            `<th><button class="th-btn" data-act="sort" data-key="${k}">${l}${sort.key === k ? (sort.dir > 0 ? ' ▲' : ' ▼') : ''}</button></th>`,
+            `<th><button class="th-btn" data-act="sort" data-key="${esc(k)}">${esc(l)}${sort.key === k ? (sort.dir > 0 ? ' ▲' : ' ▼') : ''}</button></th>`,
         )
         .join('')}</tr></thead>
       <tbody>${
@@ -436,14 +516,15 @@
           <td>${dueCell(t)}</td>
           <td>${pill(WB.statusOf(t))}</td>
           <td>${flags(t)}</td>
-          <td>${esc((WB.milestone(t.milestoneId) || {}).name || '')}</td>
+          ${p.kind === 'project' ? `<td>${esc((WB.milestone(t.milestoneId) || {}).name || '')}</td>` : ''}
+          ${fields.map((f) => `<td>${esc(f.type === 'date' ? fmtDate((t.custom || {})[f.id] || '') : (t.custom || {})[f.id] || '')}</td>`).join('')}
         </tr>`;
           })
           .join('') ||
-        `<tr><td colspan="9">${empty('Chưa có công việc nào.')}</td></tr>`
+        `<tr><td colspan="${cols.length + 1}">${empty('Chưa có công việc nào.')}</td></tr>`
       }</tbody>
     </table></div>
-    ${WB.listsOf(p.id)[0] ? quickAdd('qa-table', `data-project="${p.id}" data-tasklist="${WB.listsOf(p.id)[0].id}"`, `+ Thêm công việc vào “${esc(WB.listsOf(p.id)[0].name)}”, nhấn Enter`) : ''}
+    ${first ? quickAdd('qa-table', `data-project="${p.id}" data-tasklist="${first.id}"`, `+ Thêm công việc vào “${esc(first.name)}”, nhấn Enter`) : ''}
     </section>`;
   };
 
@@ -470,9 +551,10 @@
       ${flags(t) || badges(t) ? `<div class="card-tags">${flags(t)}${badges(t)}</div>` : ''}
       <div class="card-foot">${dueCell(t)}${group === 'status' ? '' : pill(WB.statusOf(t))}<span class="grow"></span>${avatar(WB.user(t.assigneeId), 'sm')}</div>
     </article>`;
+    const first = WB.listsOf(p.id)[0];
     return `
-      <div class="kbar">Xếp cột theo:
-        <select class="inp" data-chg="kanban-group" aria-label="Xếp cột theo">
+      <div class="kbar"><label for="kanban-group">Xếp cột theo:</label>
+        <select class="inp" id="kanban-group" data-chg="kanban-group">
           <option value="tasklist" ${group === 'tasklist' ? 'selected' : ''}>Danh sách việc</option>
           <option value="status" ${group === 'status' ? 'selected' : ''}>Trạng thái</option>
         </select>
@@ -482,18 +564,16 @@
         ${cols
           .map(
             (c) => `<section class="kcol" data-drop="${c.id}">
-          <h3 style="--c:${c.color}">${esc(c.name)} <span class="n">${c.tasks.length}</span></h3>
+          <h3 style="--c:${esc(c.color)}">${esc(c.name)} <span class="n">${c.tasks.length}</span></h3>
           <div class="kcards">${c.tasks.map(card).join('')}</div>
           ${
             group === 'status'
-              ? c.id === 'todo' || c.id === 'doing'
-                ? WB.listsOf(p.id)[0]
-                  ? quickAdd(
-                      `qa-k-${c.id}`,
-                      `data-project="${p.id}" data-tasklist="${WB.listsOf(p.id)[0].id}" data-status="${c.id}"`,
-                      '+ Thêm công việc',
-                    )
-                  : ''
+              ? (c.id === 'todo' || c.id === 'doing') && first
+                ? quickAdd(
+                    `qa-k-${c.id}`,
+                    `data-project="${p.id}" data-tasklist="${first.id}" data-status="${c.id}"`,
+                    '+ Thêm công việc',
+                  )
                 : ''
               : quickAdd(
                   `qa-k-${c.id}`,
@@ -508,8 +588,9 @@
       </div>`;
   };
 
+  V.GANTT_W = 30;
   V.gantt = (p, tasks) => {
-    const W = 30;
+    const W = V.GANTT_W;
     const LEFT = 260;
     const day0 = (s) => WB.toDate(s.slice(0, 10));
     const span = (t) => {
@@ -520,7 +601,7 @@
     const items = tasks.filter((t) => t.start || t.due);
     const hidden = tasks.length - items.length;
     const ms = WB.milestonesOf(p.id).filter((m) => m.due);
-    const today = day0(WB.ymd(new Date()));
+    const today = day0(WB.today());
     const dates = [today];
     if (p.start) dates.push(day0(p.start));
     if (p.end) dates.push(day0(p.end));
@@ -551,7 +632,7 @@
       const s = WB.statusOf(t);
       return `<div class="g-row">
         <div class="g-left" data-act="open-task" data-id="${t.id}">${avatar(WB.user(t.assigneeId), 'sm')}<span class="ell ${t.status === 'done' ? 'strike' : ''}">${esc(t.name)}</span></div>
-        ${track(`<div class="g-bar" data-act="open-task" data-id="${t.id}" style="left:${off(a) * W + 2}px;width:${(off(b) - off(a) + 1) * W - 4}px;background:${STATUS[s].color}" title="${esc(t.name)} · ${fmtDate(t.start) || '…'} → ${fmtDate(t.due) || '…'} · ${STATUS[s].label}"><span>${esc(t.name)}</span></div>`)}
+        ${track(`<div class="g-bar" data-gantt="${t.id}" data-min="${WB.ymd(min)}" style="left:${off(a) * W + 2}px;width:${(off(b) - off(a) + 1) * W - 4}px;background:${STATUS[s].color}" title="${esc(t.name)} · ${fmtDate(t.start) || '…'} → ${fmtDate(t.due) || '…'} · ${STATUS[s].label}. Kéo để đổi ngày, kéo mép phải để đổi hạn chót."><i class="g-h l" data-edge="start"></i><span>${esc(t.name)}</span><i class="g-h r" data-edge="due"></i></div>`)}
       </div>`;
     };
     const groups = WB.listsOf(p.id)
@@ -561,7 +642,8 @@
         return `<div class="g-row g-group"><div class="g-left">${esc(l.name)} <span class="n">${mine.length}</span></div>${track('')}</div>${mine.map(row).join('')}`;
       })
       .join('');
-    return `<section class="panel flush">
+    return `<p class="muted small hint">Kéo thanh để dời cả công việc, kéo mép trái hoặc mép phải để đổi ngày bắt đầu hoặc hạn chót. Bấm vào thanh để mở chi tiết.</p>
+    <section class="panel flush">
       <div class="gantt" data-scroll="gantt:${p.id}" data-today="${off(today) * W}">
         <div class="g-inner" style="width:${LEFT + n * W}px">
           ${weekends}
@@ -597,7 +679,7 @@
     tasks.forEach((t) => {
       if (t.due) (byDay[t.due.slice(0, 10)] ||= []).push(t);
     });
-    const today = WB.ymd(new Date());
+    const today = WB.today();
     let cells = '';
     for (let i = 0; i < 42; i++) {
       const d = WB.addDays(start, i);
@@ -629,11 +711,111 @@
     </section>`;
   };
 
+  // Tasks due in one week or one month, grouped by person: for weekly and monthly check-ins.
+  V.periodRange = () => {
+    const { unit, anchor } = ui().period;
+    const a = WB.toDate(anchor);
+    if (unit === 'month') {
+      const from = new Date(a.getFullYear(), a.getMonth(), 1);
+      const to = new Date(a.getFullYear(), a.getMonth() + 1, 0);
+      return {
+        from: WB.ymd(from),
+        to: WB.ymd(to),
+        label: `Tháng ${a.getMonth() + 1}/${a.getFullYear()}`,
+      };
+    }
+    const from = WB.addDays(a, 1 - WB.isoDow(a));
+    const to = WB.addDays(from, 6);
+    return {
+      from: WB.ymd(from),
+      to: WB.ymd(to),
+      label: `Tuần ${fmtDate(WB.ymd(from))} – ${fmtDate(WB.ymd(to))}`,
+    };
+  };
+  V.period = (p, tasks) => {
+    const { unit } = ui().period;
+    const { from, to, label } = V.periodRange();
+    const inRange = tasks.filter(
+      (t) => t.due && t.due.slice(0, 10) >= from && t.due.slice(0, 10) <= to,
+    );
+    const c = WB.counts(inRange);
+    const people = [...new Set(inRange.map((t) => t.assigneeId))].sort(
+      (a, b) =>
+        !a ? 1 : !b ? -1 : WB.userName(a).localeCompare(WB.userName(b), 'vi'),
+    );
+    const stat = (n, text, cls = '') =>
+      `<div class="stat ${cls}"><b>${n}</b><span>${text}</span></div>`;
+    return `<section class="panel flush">
+      <div class="cal-bar">
+        <div class="seg" role="group" aria-label="Độ dài kỳ">
+          <button class="${unit === 'week' ? 'on' : ''}" data-act="period-unit" data-unit="week">Tuần</button>
+          <button class="${unit === 'month' ? 'on' : ''}" data-act="period-unit" data-unit="month">Tháng</button>
+        </div>
+        <button class="btn" data-act="period-move" data-dir="-1" aria-label="Kỳ trước">‹</button>
+        <strong>${label}</strong>
+        <button class="btn" data-act="period-move" data-dir="1" aria-label="Kỳ sau">›</button>
+        <button class="btn" data-act="period-move" data-dir="0">Kỳ này</button>
+      </div>
+    </section>
+    <div class="stats">${stat(c.total, 'Việc có hạn trong kỳ')}${stat(c.done + c.late, 'Đã xong', 'green')}${stat(c.todo + c.doing + c.review, 'Chưa xong')}${stat(c.overdue, 'Quá hạn', 'red')}</div>
+    ${
+      people
+        .map((uid) => {
+          const mine = inRange
+            .filter((t) => t.assigneeId === uid)
+            .sort((a, b) => a.due.localeCompare(b.due));
+          const k = WB.counts(mine);
+          const u = WB.user(uid);
+          return `<section class="panel"><h2>${u ? `${avatar(u, 'sm')} ${esc(u.name)}` : 'Chưa giao cho ai'} <span class="n">${k.done + k.late}/${k.total} xong</span>${k.overdue ? ` <span class="red small">${k.overdue} quá hạn</span>` : ''}</h2>${mine.map((t) => taskRow(t)).join('')}</section>`;
+        })
+        .join('') ||
+      `<section class="panel">${empty('Không có việc nào có hạn chót trong kỳ này.')}</section>`
+    }`;
+  };
+
+  // Everything that happened in the project, newest first.
+  V.stream = (p) => {
+    const ids = new Set(WB.tasksOf(p.id).map((t) => t.id));
+    const items = [
+      ...st()
+        .activity.filter((a) => ids.has(a.taskId))
+        .map((a) => ({ ...a, type: 'act' })),
+      ...st()
+        .comments.filter((c) => ids.has(c.taskId))
+        .map((c) => ({ ...c, type: 'cmt' })),
+    ]
+      .sort((a, b) => b.at.localeCompare(a.at))
+      .slice(0, 200);
+    const todayStr = WB.today();
+    const yest = WB.shiftDate(todayStr, -1);
+    let lastDay = '';
+    const rows = items
+      .map((it) => {
+        const t = WB.task(it.taskId);
+        const u = WB.user(it.userId);
+        const d = it.at.slice(0, 10);
+        let head = '';
+        if (d !== lastDay) {
+          lastDay = d;
+          head = `<h3 class="group">${d === todayStr ? 'Hôm nay' : d === yest ? 'Hôm qua' : fmtDate(d)}</h3>`;
+        }
+        const who = `<b>${esc(u ? u.name : 'Người đã rời đi')}</b>`;
+        const link = `<button class="link" data-act="open-task" data-id="${it.taskId}">${esc(t ? t.name : '')}</button>`;
+        const what =
+          it.type === 'cmt'
+            ? `${who} đã bình luận ở ${link}<blockquote>${esc(it.text)}</blockquote>`
+            : `${who} ${esc(it.text)} · ${link}`;
+        return `${head}<div class="feed">${avatar(u, 'sm')}<div class="feed-body">${what}</div><span class="muted small">${it.at.slice(11, 16)}</span></div>`;
+      })
+      .join('');
+    return `<section class="panel">${rows || empty('Chưa có hoạt động nào trong dự án này.')}${items.length === 200 ? '<p class="muted small">Chỉ hiện 200 hoạt động gần nhất.</p>' : ''}</section>`;
+  };
+
   V.milestones = (p) => {
     const list = [...WB.milestonesOf(p.id)].sort((a, b) =>
       (a.due || '9').localeCompare(b.due || '9'),
     );
-    const today = WB.ymd(new Date());
+    const today = WB.today();
     return `<section class="panel">
       <p class="muted small">Mục tiêu là các mốc quan trọng của dự án. Gắn công việc vào mục tiêu (trong chi tiết công việc) để theo dõi mốc đó xong được bao nhiêu.</p>
       ${
@@ -648,419 +830,17 @@
           <div class="ms-head"><span class="ms-ico">◆</span><strong>${esc(m.name)}</strong>
             <span class="due ${late ? 'red' : ''}">${m.due ? 'Hạn ' + fmtDate(m.due) : 'Chưa có hạn'}</span>
             <span class="grow"></span>${bar(pr.pct)}<span class="small">${pr.done}/${pr.total} việc</span>
-            <button class="icon-btn" data-act="del-milestone" data-id="${m.id}" title="Xóa mục tiêu">🗑</button></div>
+            <button class="icon-btn" data-act="del-milestone" data-id="${m.id}" title="Xóa mục tiêu" aria-label="Xóa mục tiêu ${esc(m.name)}">🗑</button></div>
           ${linked.map((t) => taskRow(t)).join('') || '<div class="muted small pad">Chưa có công việc nào gắn với mục tiêu này.</div>'}
         </div>`;
           })
           .join('') || empty('Dự án chưa có mục tiêu nào.')
       }
       <form class="inline-form" data-form="add-milestone" data-project="${p.id}">
-        <input class="inp grow" name="name" required placeholder="Tên mục tiêu mới" aria-label="Tên mục tiêu" />
-        <input class="inp" type="date" name="due" aria-label="Hạn của mục tiêu" />
+        <input class="inp grow" id="ms-name" name="name" required placeholder="Tên mục tiêu mới" aria-label="Tên mục tiêu" />
+        <input class="inp" id="ms-due" type="date" name="due" aria-label="Hạn của mục tiêu" />
         <button class="btn primary">Thêm mục tiêu</button>
       </form>
     </section>`;
-  };
-
-  // ---------- reports ----------
-  V.reports = () => {
-    const tasks = st().tasks;
-    const c = WB.counts(tasks);
-    const projs = st().projects.filter((p) => p.kind === 'project');
-    const teams = st().projects.filter((p) => p.kind === 'team');
-    const open = tasks.filter((t) => t.status !== 'done');
-    const quad = [
-      [
-        'Quan trọng & Khẩn cấp',
-        'Làm ngay',
-        (t) => t.important && t.urgent,
-        '#e5484d',
-      ],
-      [
-        'Quan trọng, không khẩn cấp',
-        'Lên lịch để làm',
-        (t) => t.important && !t.urgent,
-        '#2f80ed',
-      ],
-      [
-        'Khẩn cấp, không quan trọng',
-        'Giao cho người khác nếu được',
-        (t) => !t.important && t.urgent,
-        '#f2994a',
-      ],
-      [
-        'Không quan trọng, không khẩn cấp',
-        'Làm sau',
-        (t) => !t.important && !t.urgent,
-        '#8a94a6',
-      ],
-    ];
-    const days = [...Array(7)].map((_, i) => {
-      const d = WB.addDays(new Date(), i - 6);
-      const key = WB.ymd(d);
-      return {
-        label: `${d.getDate()}/${d.getMonth() + 1}`,
-        n: tasks.filter(
-          (t) => t.status === 'done' && t.doneAt.slice(0, 10) === key,
-        ).length,
-      };
-    });
-    const maxDay = Math.max(1, ...days.map((d) => d.n));
-    const perUser = st().users.map((u) => {
-      const mine = tasks.filter((t) => t.assigneeId === u.id);
-      const k = WB.counts(mine);
-      return {
-        u,
-        onTime: k.done,
-        slow: k.overdue + k.late,
-        total: mine.length,
-      };
-    });
-    const top = [...perUser]
-      .sort((a, b) => b.onTime - a.onTime)
-      .filter((x) => x.onTime);
-    const slow = [...perUser]
-      .sort((a, b) => b.slow - a.slow)
-      .filter((x) => x.slow);
-    const reviewing = tasks.filter((t) => t.status === 'review');
-    const stat = (n, label, cls = '') =>
-      `<div class="stat ${cls}"><b>${n}</b><span>${label}</span></div>`;
-    const rank = (list, key, unit) =>
-      list
-        .slice(0, 5)
-        .map(
-          (x) =>
-            `<div class="rank"><a href="#member-${x.u.id}">${avatar(x.u, 'sm')} ${esc(x.u.name)}</a><b>${x[key]} ${unit}</b></div>`,
-        )
-        .join('') || '<div class="muted small">Chưa có dữ liệu.</div>';
-    return `
-      <header class="page-head"><div><h1>Báo cáo</h1><p class="sub">Tổng hợp toàn bộ dự án và nhóm, tính từ dữ liệu đang có trong ứng dụng.</p></div></header>
-      <div class="stats">
-        ${stat(projs.length, 'Dự án')}${stat(teams.length, 'Nhóm')}${stat(c.total, 'Công việc')}${stat(st().users.length, 'Thành viên')}
-        ${stat(c.overdue, 'Việc quá hạn', 'red')}${stat(c.review, 'Việc chờ duyệt', 'amber')}
-      </div>
-      <div class="grid2">
-        <section class="panel"><h2>Công việc theo trạng thái</h2>${stackBar(c)}</section>
-        <section class="panel"><h2>Việc hoàn thành 7 ngày qua</h2>
-          <div class="cols">${days.map((d) => `<div class="col"><b>${d.n}</b><i style="height:${(d.n / maxDay) * 90 + 2}px"></i><span>${d.label}</span></div>`).join('')}</div>
-        </section>
-      </div>
-      <section class="panel"><h2>Ma trận ưu tiên (việc chưa xong)</h2>
-        <div class="quad">${quad
-          .map(([title, hint, test, color]) => {
-            const list = open.filter(test);
-            return `<div class="q" style="--c:${color}"><h3>${title} <span class="n">${list.length}</span></h3><p class="muted small">${hint}</p>
-            ${list
-              .slice(0, 5)
-              .map(
-                (t) =>
-                  `<button class="q-task" data-act="open-task" data-id="${t.id}">${esc(t.name)}</button>`,
-              )
-              .join('')}
-            ${list.length > 5 ? `<span class="muted small">+${list.length - 5} việc nữa</span>` : ''}</div>`;
-          })
-          .join('')}</div>
-      </section>
-      <section class="panel flush"><h2 class="pad-h">Theo từng dự án / nhóm</h2><div class="scroll-x"><table class="tbl">
-        <thead><tr><th>Tên</th><th>Loại</th><th>Tình trạng</th><th>Tổng việc</th><th>Xong</th><th>Quá hạn</th><th>Chờ duyệt</th><th>Tiến độ</th></tr></thead>
-        <tbody>${st()
-          .projects.map((p) => {
-            const k = WB.counts(WB.tasksOf(p.id));
-            const pr = WB.progress(WB.tasksOf(p.id));
-            return `<tr><td><a href="#p-${p.id}"><i class="dot" style="background:${p.color}"></i> ${esc(p.name)}</a></td><td>${p.kind === 'project' ? 'Dự án' : 'Nhóm'}</td>
-            <td>${p.kind === 'project' ? `<span class="stage" style="--c:${STAGES[p.stage].color}">${STAGES[p.stage].label}</span>` : '—'}</td>
-            <td>${k.total}</td><td>${k.done + k.late}</td><td class="${k.overdue ? 'red' : ''}">${k.overdue}</td><td>${k.review}</td><td>${bar(pr.pct, p.color)} ${pr.pct}%</td></tr>`;
-          })
-          .join('')}</tbody></table></div>
-      </section>
-      <div class="grid3">
-        <section class="panel"><h2>Hoàn thành đúng hạn nhiều nhất</h2>${rank(top, 'onTime', 'việc')}</section>
-        <section class="panel"><h2>Trễ hạn nhiều nhất</h2><p class="muted small">Tính cả việc đang quá hạn và việc xong muộn.</p>${rank(slow, 'slow', 'việc')}</section>
-        <section class="panel"><h2>Việc đang chờ duyệt</h2>${reviewing.map((t) => taskRow(t)).join('') || '<div class="muted small">Không có việc nào chờ duyệt.</div>'}</section>
-      </div>`;
-  };
-
-  // ---------- members ----------
-  const memberCounts = (id) => {
-    const c = WB.counts(st().tasks.filter((t) => t.assigneeId === id));
-    return {
-      todo: c.todo,
-      doing: c.doing + c.review,
-      done: c.done + c.late,
-      overdue: c.overdue,
-      total: c.total,
-      raw: c,
-    };
-  };
-  V.members = () => `
-    <header class="page-head">
-      <div><h1>Thành viên</h1><p class="sub">Bấm vào một người để xem báo cáo công việc của người đó.</p></div>
-      <div class="actions"><button class="btn primary" data-act="new-member">+ Thành viên</button></div>
-    </header>
-    <section class="panel flush"><div class="scroll-x"><table class="tbl">
-      <thead><tr><th>Thành viên</th><th>Chức danh</th><th>Cần làm</th><th>Đang làm</th><th>Hoàn thành</th><th>Quá hạn</th><th>Tổng</th></tr></thead>
-      <tbody>${st()
-        .users.map((u) => {
-          const c = memberCounts(u.id);
-          return `<tr data-act="go" data-href="#member-${u.id}"><td>${avatar(u, 'sm')} <strong>${esc(u.name)}</strong>${u.id === st().me ? ' <span class="kind">Bạn</span>' : ''}</td>
-          <td>${esc(u.title || '')}</td><td>${c.todo}</td><td>${c.doing}</td><td>${c.done}</td><td class="${c.overdue ? 'red' : ''}">${c.overdue}</td><td>${c.total}</td></tr>`;
-        })
-        .join('')}</tbody>
-    </table></div></section>`;
-
-  V.member = (id) => {
-    const u = WB.user(id);
-    if (!u)
-      return `<header class="page-head"><h1>Không tìm thấy thành viên</h1></header>`;
-    const mine = st().tasks.filter((t) => t.assigneeId === id);
-    const c = memberCounts(id);
-    const stat = (n, label, cls = '') =>
-      `<div class="stat ${cls}"><b>${n}</b><span>${label}</span></div>`;
-    const groups = st()
-      .projects.map((p) => [p, mine.filter((t) => t.projectId === p.id)])
-      .filter(([, list]) => list.length);
-    return `
-      <header class="page-head">
-        <div><div class="crumbs"><a href="#members">Thành viên</a> › Báo cáo</div>
-          <h1>${avatar(u)} ${esc(u.name)}</h1><p class="sub">${esc(u.title || '')}</p></div>
-        <div class="actions no-print">
-          <button class="btn" data-act="export-member" data-id="${u.id}">Xuất Excel (CSV)</button>
-          <button class="btn danger" data-act="del-member" data-id="${u.id}">Xóa thành viên</button>
-        </div>
-      </header>
-      <div class="stats">${stat(c.todo, 'Cần làm')}${stat(c.doing, 'Đang làm')}${stat(c.done, 'Hoàn thành', 'green')}${stat(c.overdue, 'Quá hạn', 'red')}</div>
-      <section class="panel"><h2>Tỷ lệ công việc</h2>${stackBar(c.raw)}</section>
-      ${
-        groups
-          .map(
-            ([p, list]) =>
-              `<section class="panel"><h2><a href="#p-${p.id}"><i class="dot" style="background:${p.color}"></i> ${esc(p.name)}</a> <span class="n">${list.length}</span></h2>${list.map((t) => taskRow(t)).join('')}</section>`,
-          )
-          .join('') ||
-        `<section class="panel">${empty('Người này chưa được giao việc nào.')}</section>`
-      }`;
-  };
-
-  // ---------- task detail (right-hand drawer) ----------
-  V.drawer = () => {
-    const t = WB.task(ui().taskId);
-    if (!t) return '';
-    const p = WB.project(t.projectId);
-    const parent = WB.task(t.parentId);
-    const s = WB.statusOf(t);
-    const admin = WB.isAdmin(p);
-    const members = p.memberIds.map(WB.user).filter(Boolean);
-    const sub = WB.subs(t.id);
-    const blockers = WB.blockers(t);
-    const candidates = WB.tasksOf(p.id).filter(
-      (x) => x.id !== t.id && !x.parentId && !t.dependsOn.includes(x.id),
-    );
-    let main;
-    if (t.status === 'done')
-      main = `<button class="btn" data-act="toggle-done" data-id="${t.id}">↺ Mở lại</button>`;
-    else if (t.status === 'review')
-      main = admin
-        ? `<button class="btn primary" data-act="toggle-done" data-id="${t.id}">✓ Duyệt hoàn thành</button><button class="btn" data-act="reject" data-id="${t.id}">Trả lại làm tiếp</button>`
-        : `<button class="btn" data-act="reject" data-id="${t.id}">Rút lại yêu cầu duyệt</button>`;
-    else
-      main = `<button class="btn primary" data-act="toggle-done" data-id="${t.id}">✓ ${p.review && !admin ? 'Gửi duyệt hoàn thành' : 'Hoàn thành'}</button>`;
-    const row = (label, html) =>
-      `<div class="frow"><label>${label}</label><div class="fval">${html}</div></div>`;
-    return `
-      <div class="drawer-back" data-act="close-drawer"></div>
-      <aside class="drawer" role="dialog" aria-label="Chi tiết công việc">
-        <div class="drawer-top">${main}${pill(s)}<span class="grow"></span>
-          <button class="icon-btn" data-act="del-task" data-id="${t.id}" title="Xóa công việc">🗑</button>
-          <button class="icon-btn" data-act="close-drawer" title="Đóng (Esc)">✕</button></div>
-        <div class="drawer-body" data-scroll="drawer:${t.id}">
-          <div class="crumbs"><a href="#p-${p.id}" data-act="close-drawer-soft"><i class="dot" style="background:${p.color}"></i> ${esc(p.name)}</a>${
-            parent
-              ? ` › <button class="link" data-act="open-task" data-id="${parent.id}">${esc(parent.name)}</button>`
-              : ''
-          }</div>
-          <textarea class="title-inp" rows="1" data-chg="field" data-field="name" aria-label="Tên công việc">${esc(t.name)}</textarea>
-          ${
-            blockers.length
-              ? `<div class="warn">⛔ Còn ${blockers.length} việc phải làm xong trước: ${blockers.map((b) => `<button class="link" data-act="open-task" data-id="${b.id}">${esc(b.name)}</button>`).join(', ')}</div>`
-              : ''
-          }
-          ${row('Người thực hiện', `<select class="inp" data-chg="field" data-field="assigneeId">${options(members, t.assigneeId, 'Chưa giao')}</select>`)}
-          ${row(
-            'Người theo dõi',
-            `<details class="multi"><summary>${
-              t.followerIds.map((id) => avatar(WB.user(id), 'sm')).join('') ||
-              '<span class="muted">Chưa có — bấm để chọn</span>'
-            }</summary>${members
-              .map(
-                (u) =>
-                  `<label class="opt"><input type="checkbox" data-chg="toggle-follower" value="${u.id}" ${t.followerIds.includes(u.id) ? 'checked' : ''} /> ${esc(u.name)}</label>`,
-              )
-              .join('')}</details>`,
-          )}
-          ${
-            parent
-              ? ''
-              : row(
-                  'Danh sách việc',
-                  `<select class="inp" data-chg="field" data-field="tasklistId">${options(WB.listsOf(p.id), t.tasklistId)}</select>`,
-                )
-          }
-          ${row('Ngày bắt đầu', `<input class="inp" type="date" data-chg="field" data-field="start" value="${esc(t.start)}" />`)}
-          ${row(
-            'Hạn chót',
-            `<input class="inp" type="date" data-chg="field" data-field="dueDate" value="${esc(t.due.slice(0, 10))}" />
-             <input class="inp" type="time" data-chg="field" data-field="dueTime" value="${esc(t.due.slice(11))}" title="Giờ (không bắt buộc)" aria-label="Giờ hạn chót" />`,
-          )}
-          ${
-            t.status === 'done' || t.status === 'review'
-              ? ''
-              : row(
-                  'Trạng thái',
-                  `<select class="inp" data-chg="field" data-field="status"><option value="todo" ${t.status === 'todo' ? 'selected' : ''}>Cần làm</option><option value="doing" ${t.status === 'doing' ? 'selected' : ''}>Đang làm</option></select>`,
-                )
-          }
-          ${row(
-            'Nhãn',
-            `<button class="toggle imp ${t.important ? 'on' : ''}" data-act="toggle-flag" data-flag="important">Quan trọng</button>
-             <button class="toggle urg ${t.urgent ? 'on' : ''}" data-act="toggle-flag" data-flag="urgent">Khẩn cấp</button>`,
-          )}
-          ${
-            p.kind === 'project'
-              ? row(
-                  'Mục tiêu',
-                  `<select class="inp" data-chg="field" data-field="milestoneId">${options(WB.milestonesOf(p.id), t.milestoneId, 'Không gắn')}</select>`,
-                )
-              : ''
-          }
-          ${t.doneAt ? row('Xong lúc', `<span>${fmtDate(t.doneAt)}</span>`) : ''}
-
-          <h4>Mô tả</h4>
-          <textarea class="inp area" data-chg="field" data-field="desc" placeholder="Viết thêm chi tiết về công việc…">${esc(t.desc)}</textarea>
-
-          <h4>Danh sách kiểm tra <span class="n">${t.checklist.filter((c) => c.done).length}/${t.checklist.length}</span></h4>
-          ${t.checklist
-            .map(
-              (c) =>
-                `<div class="check ${c.done ? 'is-done' : ''}"><label><input type="checkbox" data-chg="toggle-check" value="${c.id}" ${c.done ? 'checked' : ''} /> <span>${esc(c.text)}</span></label><button class="icon-btn" data-act="del-check" data-id="${c.id}" title="Xóa dòng này">✕</button></div>`,
-            )
-            .join('')}
-          <input class="quick" id="add-check" data-enter="add-check" placeholder="+ Thêm một dòng kiểm tra, nhấn Enter" aria-label="Thêm dòng kiểm tra" autocomplete="off" />
-
-          ${
-            parent
-              ? ''
-              : `<h4>Công việc con <span class="n">${sub.filter((x) => x.status === 'done').length}/${sub.length}</span></h4>
-          ${sub.map((x) => taskRow(x)).join('')}
-          ${quickAdd('add-sub', `data-project="${p.id}" data-tasklist="${t.tasklistId}" data-parent="${t.id}"`, '+ Thêm công việc con, nhấn Enter')}
-
-          <h4>Phụ thuộc <span class="muted small">— việc này chỉ nên làm sau khi các việc dưới đây xong</span></h4>
-          ${t.dependsOn
-            .map(WB.task)
-            .filter(Boolean)
-            .map(
-              (d) =>
-                `<div class="dep"><button class="link" data-act="open-task" data-id="${d.id}">${esc(d.name)}</button>${pill(WB.statusOf(d))}<span class="grow"></span><button class="icon-btn" data-act="del-dep" data-id="${d.id}" title="Bỏ phụ thuộc">✕</button></div>`,
-            )
-            .join('')}
-          <select class="inp wide" data-chg="add-dep" aria-label="Thêm việc phải làm trước">${options(candidates, '', '+ Chọn một việc phải làm trước…')}</select>`
-          }
-
-          <h4>Kết quả</h4>
-          <textarea class="inp area" data-chg="field" data-field="result" placeholder="Ghi lại kết quả khi làm xong (đường dẫn, số liệu, ghi chú…)">${esc(t.result)}</textarea>
-
-          <h4>Bình luận <span class="n">${t.comments.length}</span></h4>
-          ${t.comments
-            .map((c) => {
-              const u = WB.user(c.userId);
-              return `<div class="cmt">${avatar(u, 'sm')}<div><b>${esc(u ? u.name : 'Người đã xóa')}</b> <span class="muted small">${fmtDate(c.at)}</span><p>${esc(c.text)}</p></div></div>`;
-            })
-            .join('')}
-          <input class="quick" id="add-comment" data-enter="add-comment" placeholder="Viết bình luận, nhấn Enter để gửi" aria-label="Viết bình luận" autocomplete="off" />
-        </div>
-      </aside>`;
-  };
-
-  // ---------- pop-up forms ----------
-  V.modal = () => {
-    const m = ui().modal;
-    if (!m) return '';
-    let title = '';
-    let body = '';
-    if (m.type === 'project') {
-      const p = m.id ? WB.project(m.id) : null;
-      const kind = p ? p.kind : m.kind;
-      const word = kind === 'project' ? 'dự án' : 'nhóm';
-      const v = p || {
-        name: '',
-        deptId: '',
-        adminId: st().me,
-        memberIds: [st().me],
-        type: 'internal',
-        review: false,
-        start: '',
-        end: '',
-        stage: 'plan',
-        desc: '',
-        color: WB.COLORS[st().projects.length % WB.COLORS.length],
-      };
-      title = p ? `Cài đặt ${word}` : `Tạo ${word} mới`;
-      body = `<form data-form="save-project" data-id="${p ? p.id : ''}" data-kind="${kind}">
-        <label class="fld">Tên ${word}<input class="inp" name="name" required value="${esc(v.name)}" autofocus /></label>
-        <div class="two">
-          <label class="fld">Phòng ban<select class="inp" name="deptId">${options(st().departments, v.deptId, 'Chưa thuộc phòng ban')}</select></label>
-          <label class="fld">Người quản trị<select class="inp" name="adminId">${options(st().users, v.adminId)}</select></label>
-        </div>
-        <fieldset class="fld"><legend>Thành viên</legend><div class="checks">${st()
-          .users.map(
-            (u) =>
-              `<label class="opt"><input type="checkbox" name="memberIds" value="${u.id}" ${v.memberIds.includes(u.id) ? 'checked' : ''} /> ${esc(u.name)}</label>`,
-          )
-          .join('')}</div></fieldset>
-        <div class="two">
-          <label class="fld">Phân loại<select class="inp" name="type"><option value="internal" ${v.type === 'internal' ? 'selected' : ''}>Nội bộ</option><option value="customer" ${v.type === 'customer' ? 'selected' : ''}>Làm cho khách hàng</option></select></label>
-          <label class="fld opt-line"><input type="checkbox" name="review" ${v.review ? 'checked' : ''} /> Việc phải được người quản trị duyệt mới tính là xong</label>
-        </div>
-        <details class="adv" ${p ? 'open' : ''}><summary>Cài đặt nâng cao</summary>
-          ${
-            kind === 'project'
-              ? `<div class="two">
-            <label class="fld">Ngày bắt đầu<input class="inp" type="date" name="start" value="${esc(v.start)}" /></label>
-            <label class="fld">Ngày kết thúc<input class="inp" type="date" name="end" value="${esc(v.end)}" /></label>
-          </div>
-          <label class="fld">Tình trạng<select class="inp" name="stage">${options(
-            Object.entries(STAGES).map(([k, s]) => ({ id: k, name: s.label })),
-            v.stage,
-          )}</select></label>`
-              : ''
-          }
-          <label class="fld">Mô tả<textarea class="inp area" name="desc">${esc(v.desc)}</textarea></label>
-          <fieldset class="fld"><legend>Màu</legend><div class="colors">${WB.COLORS.map(
-            (c) =>
-              `<label><input type="radio" name="color" value="${c}" ${v.color === c ? 'checked' : ''} /><i style="background:${c}"></i></label>`,
-          ).join('')}</div></fieldset>
-        </details>
-        <div class="modal-foot">
-          ${p ? `<button type="button" class="btn danger" data-act="del-project" data-id="${p.id}">Xóa ${word}</button>` : ''}
-          <span class="grow"></span>
-          <button type="button" class="btn" data-act="close-modal">Hủy</button>
-          <button class="btn primary">${p ? 'Lưu' : `Tạo ${word}`}</button>
-        </div>
-      </form>`;
-    } else if (m.type === 'dept') {
-      title = 'Tạo phòng ban';
-      body = `<form data-form="save-dept">
-        <label class="fld">Tên phòng ban<input class="inp" name="name" required autofocus /></label>
-        <div class="modal-foot"><span class="grow"></span><button type="button" class="btn" data-act="close-modal">Hủy</button><button class="btn primary">Tạo</button></div>
-      </form>`;
-    } else if (m.type === 'member') {
-      title = 'Thêm thành viên';
-      body = `<form data-form="save-member">
-        <label class="fld">Họ và tên<input class="inp" name="name" required autofocus /></label>
-        <label class="fld">Chức danh<input class="inp" name="title" placeholder="Ví dụ: Kế toán" /></label>
-        <div class="modal-foot"><span class="grow"></span><button type="button" class="btn" data-act="close-modal">Hủy</button><button class="btn primary">Thêm</button></div>
-      </form>`;
-    }
-    return `<div class="modal-back" data-act="close-modal"></div>
-      <div class="modal" role="dialog" aria-label="${title}"><div class="modal-head"><h2>${title}</h2><button class="icon-btn" data-act="close-modal" title="Đóng">✕</button></div>${body}</div>`;
   };
 })();
