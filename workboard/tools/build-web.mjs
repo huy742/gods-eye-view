@@ -1,5 +1,7 @@
 // Builds one self-contained page (styles and scripts inlined, no <html>/<head>/<body> wrapper)
 // for hosts that publish a single HTML fragment and add their own document shell.
+// The page always keeps its data in the browser: the shared (Supabase) parts,
+// marked data-cloud in index.html, are left out.
 // Usage: node tools/build-web.mjs <output.html>
 import { readFile, writeFile } from 'node:fs/promises';
 
@@ -13,7 +15,9 @@ if (!out) {
 
 const html = await read('index.html');
 const title = html.match(/<title>([^<]*)<\/title>/)[1];
-let body = html.match(/<body>([\s\S]*)<\/body>/)[1];
+let body = html
+  .match(/<body>([\s\S]*)<\/body>/)[1]
+  .replace(/\s*<script src="[^"]+" data-cloud><\/script>/g, '');
 const sources = [...body.matchAll(/<script src="([^"]+)"><\/script>/g)];
 for (const [tag, file] of sources) {
   const code = await read(file);

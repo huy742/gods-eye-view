@@ -1660,7 +1660,7 @@ tr.is-done .tname,
   }
   .side-body {
     display: none;
-    max-height: 70vh;
+    max-height: calc(100vh - 72px - env(safe-area-inset-top, 0px));
   }
   .side-body.open {
     display: flex;
@@ -2211,4 +2211,135 @@ details.menu.right .menu-list {
   .brand .bell {
     margin-left: auto;
   }
+}
+
+/* ---------- shared (online) version: sign-in and workspace ---------- */
+#auth {
+  display: none;
+}
+.auth-on #app,
+.auth-on #drawer,
+.auth-on #panel,
+.auth-on #modal {
+  display: none;
+}
+.auth-on #auth {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding-block: 24px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  background: var(--bg);
+}
+.auth-card {
+  width: min(460px, 100%);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.auth-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 700;
+  font-size: 17px;
+}
+.auth-brand .logo {
+  color: var(--accent-ink);
+}
+.auth-card h1 {
+  font-size: 21px;
+}
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.inline-auth {
+  flex-direction: row;
+  align-items: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.inline-auth .fld {
+  flex: 1;
+  margin: 0;
+  min-width: 200px;
+}
+.wide-btn {
+  width: 100%;
+  padding: 10px;
+  margin-top: 4px;
+}
+.auth-links {
+  font-size: 13px;
+  color: var(--muted);
+}
+.ws-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.ws-pick {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  border-radius: 10px;
+  padding: 10px 12px;
+  cursor: pointer;
+  text-align: left;
+}
+.ws-pick:hover {
+  border-color: var(--accent);
+}
+.ws-select {
+  width: 100%;
+  margin: 6px 0 10px;
+  background: var(--side-hover);
+  border: 1px solid var(--side-line);
+  color: var(--on-color);
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+.ws-select option {
+  color: var(--ink);
+  background: var(--panel);
+}
+.who-name {
+  display: flex;
+  flex-direction: column;
+  color: var(--on-color);
+  font-size: 13px;
+  min-width: 0;
+}
+.who-name span {
+  color: var(--side-muted);
+  font-size: 11px;
+}
+.side-actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.sync {
+  font-size: 11px;
+  color: var(--side-muted);
+  margin: 4px 0 0;
+}
+.sync.saving {
+  color: #f2c94c;
+}
+.sync.error,
+.sync.offline {
+  color: #ff8a8e;
 }
